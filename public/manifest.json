@@ -1,0 +1,19 @@
+{
+  "name": "ChessXChess - Collaborative Chess",
+  "short_name": "ChessXChess",
+  "description": "A collaborative chess game where everyone takes turns",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0a",
+  "theme_color": "#b58863",
+  "orientation": "any",
+  "categories": ["games", "entertainment"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
