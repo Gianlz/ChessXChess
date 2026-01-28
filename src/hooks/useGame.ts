@@ -36,7 +36,7 @@ interface UseGameReturn {
 }
 
 export function useGame(): UseGameReturn {
-  const { gameState, queueState, connectionStatus, reconnect } = useGameStream()
+  const { gameState, queueState, connectionStatus, reconnect, refresh } = useGameStream()
 
   const [playerId, setPlayerId] = useState<string | null>(null)
   const [playerName, setPlayerName] = useState<string | null>(null)
@@ -162,11 +162,13 @@ export function useGame(): UseGameReturn {
       const data = await response.json()
       if (!data.success) {
         setError(data.error || 'Failed to join queue')
+      } else {
+        await refresh() // Immediate update after join
       }
     } catch {
       setError('Failed to join queue')
     }
-  }, [playerId, playerName])
+  }, [playerId, playerName, refresh])
 
   const leaveQueue = useCallback(async () => {
     if (!playerId) return
@@ -182,10 +184,11 @@ export function useGame(): UseGameReturn {
       })
       setSelectedSquare(null)
       setValidMoves([])
+      await refresh() // Immediate update after leave
     } catch {
       setError('Failed to leave queue')
     }
-  }, [playerId])
+  }, [playerId, refresh])
 
   // Calculate valid moves client-side using chess.js - no API call needed!
   const getValidMoves = useCallback((square: Square): Move[] => {
@@ -235,6 +238,7 @@ export function useGame(): UseGameReturn {
       if (data.success) {
         setSelectedSquare(null)
         setValidMoves([])
+        await refresh() // Immediate update after move
         return true
       } else {
         setError(data.error || 'Invalid move')
@@ -244,7 +248,7 @@ export function useGame(): UseGameReturn {
       setError('Failed to make move')
       return false
     }
-  }, [playerId, canPlay])
+  }, [playerId, canPlay, refresh])
 
   const resetGame = useCallback(async () => {
     const pass = prompt('Enter admin password to reset game:')
@@ -283,11 +287,13 @@ export function useGame(): UseGameReturn {
       const data = await response.json()
       if (!data.success) {
         setError(data.error || 'Failed to confirm')
+      } else {
+        await refresh() // Immediate update after confirm
       }
     } catch {
       setError('Failed to confirm ready')
     }
-  }, [playerId])
+  }, [playerId, refresh])
 
   // Clear error after timeout
   useEffect(() => {

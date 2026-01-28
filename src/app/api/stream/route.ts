@@ -8,11 +8,11 @@ export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 export const maxDuration = 60
 
-// Polling interval in ms - balance between responsiveness and server load
-const POLL_INTERVAL_MS = 2000
+// DEPRECATED: This SSE endpoint is kept for backward compatibility.
+// The recommended approach is client-side polling of GET /api/game
+// which achieves true event-only Redis operations.
 
 export async function GET(request: NextRequest) {
-  // Rate limit check for stream connections
   const clientId = getClientIdentifier(request)
   const rateLimitResult = await checkRateLimit(clientId, 'general')
   
@@ -32,7 +32,6 @@ export async function GET(request: NextRequest) {
 
   const encoder = new TextEncoder()
   let isActive = true
-  let lastVersion = -1
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -45,49 +44,22 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      // Fetch and send initial state immediately from Redis
+      // Send initial state only - no polling
+      // Clients should use GET /api/game for updates
       try {
-        const [game, queue, version] = await Promise.all([
+        const [game, queue] = await Promise.all([
           gameStore.getGameState(),
           gameStore.getQueueState(),
-          gameStore.getVersion(),
         ])
-        lastVersion = version
         sendEvent({ game, queue })
-        logger.debug('Stream: sent initial state', { version })
+        logger.debug('Stream: sent initial state')
       } catch (err) {
         logger.error('Stream: failed to fetch initial state', { error: String(err) })
-        // Send empty state so client knows connection is working
         sendEvent({ error: 'Failed to fetch initial state' })
       }
 
-      // Poll for updates - this is the serverless-compatible approach
-      const pollInterval = setInterval(async () => {
-        if (!isActive) {
-          clearInterval(pollInterval)
-          return
-        }
-
-        try {
-          const currentVersion = await gameStore.getVersion()
-          
-          // Only fetch and send full state if version changed
-          if (currentVersion !== lastVersion) {
-            const [game, queue] = await Promise.all([
-              gameStore.getGameState(),
-              gameStore.getQueueState(),
-            ])
-            lastVersion = currentVersion
-            sendEvent({ game, queue })
-            logger.debug('Stream: sent update', { version: currentVersion })
-          }
-        } catch (err) {
-          logger.error('Stream: poll error', { error: String(err) })
-          // Don't kill the stream on transient errors
-        }
-      }, POLL_INTERVAL_MS)
-
-      // Heartbeat every 30 seconds to keep connection alive
+      // Heartbeat only - no polling for updates
+      // This keeps the connection alive for clients still using SSE
       const heartbeatInterval = setInterval(() => {
         if (!isActive) {
           clearInterval(heartbeatInterval)
@@ -100,25 +72,20 @@ export async function GET(request: NextRequest) {
         }
       }, 30000)
 
-      // Cleanup on client disconnect
       request.signal.addEventListener('abort', () => {
         isActive = false
-        clearInterval(pollInterval)
         clearInterval(heartbeatInterval)
-        logger.debug('Stream: client disconnected')
       })
 
-      // Clean up before Vercel timeout (60s max, close at 55s)
+      // Clean up before Vercel timeout
       setTimeout(() => {
         isActive = false
-        clearInterval(pollInterval)
         clearInterval(heartbeatInterval)
         try {
           controller.close()
         } catch {
           // Already closed
         }
-        logger.debug('Stream: timeout cleanup')
       }, 55000)
     },
     cancel() {

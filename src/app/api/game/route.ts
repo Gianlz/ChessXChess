@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server'
 import { gameStore } from '@/lib/gameStore'
 import { isRedisAvailable } from '@/lib/redis'
-import { refreshSnapshot, getSnapshot } from '@/lib/gameSnapshot'
+import { refreshSnapshot } from '@/lib/gameSnapshot'
 import { withRateLimit, secureJsonResponse, getClientIdentifier } from '@/lib/security'
 import {
   validatePlayerId,
@@ -22,17 +22,15 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const snapshot = getSnapshot()
-    if (!snapshot) {
-      return secureJsonResponse(
-        { game: null, queue: null, stale: true },
-        200,
-        rateLimitResult.headers
-      )
-    }
+    // Always fetch fresh state from Redis - this is event-driven
+    // since clients poll this endpoint only when they need data
+    const [game, queue] = await Promise.all([
+      gameStore.getGameState(),
+      gameStore.getQueueState(),
+    ])
 
     return secureJsonResponse(
-      { game: snapshot.game, queue: snapshot.queue },
+      { game, queue },
       200,
       rateLimitResult.headers
     )

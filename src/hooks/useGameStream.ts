@@ -7,7 +7,7 @@ export type { TurnState }
 
 export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
 
-interface StreamData {
+interface ApiResponse {
   game?: GameState
   queue?: QueueState
   error?: string
@@ -18,122 +18,135 @@ interface UseGameStreamReturn {
   queueState: QueueState | null
   connectionStatus: ConnectionStatus
   reconnect: () => void
+  refresh: () => Promise<void>
 }
+
+// Polling interval when tab is visible (ms)
+const POLL_INTERVAL_ACTIVE = 2000
+// Polling interval when tab is hidden (ms) - much slower to save resources
+const POLL_INTERVAL_HIDDEN = 10000
 
 export function useGameStream(): UseGameStreamReturn {
   const [gameState, setGameState] = useState<GameState | null>(null)
   const [queueState, setQueueState] = useState<QueueState | null>(null)
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting')
   
-  const eventSourceRef = useRef<EventSource | null>(null)
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-  const reconnectAttempts = useRef(0)
-  const maxReconnectAttempts = 10
-  const baseReconnectDelay = 1000
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const isVisibleRef = useRef(true)
+  const consecutiveErrorsRef = useRef(0)
+  const maxConsecutiveErrors = 5
 
-  const connect = useCallback(() => {
-    // Clean up existing connection
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close()
-      eventSourceRef.current = null
-    }
-
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current)
-      reconnectTimeoutRef.current = null
-    }
-
-    setConnectionStatus('connecting')
-
+  // Fetch game state from API
+  const fetchState = useCallback(async (): Promise<boolean> => {
     try {
-      const eventSource = new EventSource('/api/stream')
-      eventSourceRef.current = eventSource
+      const response = await fetch('/api/game', {
+        method: 'GET',
+        headers: { 'Cache-Control': 'no-cache' },
+      })
 
-      eventSource.onopen = () => {
-        setConnectionStatus('connected')
-        reconnectAttempts.current = 0
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
       }
 
-      eventSource.onmessage = (event) => {
-        try {
-          const data: StreamData = JSON.parse(event.data)
-          
-          if (data.game) {
-            setGameState(data.game)
-          }
-          if (data.queue) {
-            setQueueState(data.queue)
-          }
-          if (data.error) {
-            console.error('Stream error:', data.error)
-          }
-        } catch {
-          // Ignore parse errors (e.g., heartbeat)
-        }
+      const data: ApiResponse = await response.json()
+      
+      if (data.game) {
+        setGameState(data.game)
       }
-
-      eventSource.onerror = () => {
-        eventSource.close()
-        eventSourceRef.current = null
+      if (data.queue) {
+        setQueueState(data.queue)
+      }
+      
+      setConnectionStatus('connected')
+      consecutiveErrorsRef.current = 0
+      return true
+    } catch (err) {
+      console.error('Failed to fetch game state:', err)
+      consecutiveErrorsRef.current++
+      
+      if (consecutiveErrorsRef.current >= maxConsecutiveErrors) {
+        setConnectionStatus('error')
+      } else {
         setConnectionStatus('disconnected')
-
-        // Auto-reconnect with exponential backoff
-        if (reconnectAttempts.current < maxReconnectAttempts) {
-          const delay = Math.min(
-            baseReconnectDelay * Math.pow(2, reconnectAttempts.current),
-            30000 // Max 30 seconds
-          )
-          reconnectAttempts.current++
-          
-          reconnectTimeoutRef.current = setTimeout(() => {
-            connect()
-          }, delay)
-        } else {
-          setConnectionStatus('error')
-        }
       }
-    } catch {
-      setConnectionStatus('error')
+      return false
     }
   }, [])
 
-  const reconnect = useCallback(() => {
-    reconnectAttempts.current = 0
-    connect()
-  }, [connect])
+  // Manual refresh function exposed to consumers
+  const refresh = useCallback(async () => {
+    await fetchState()
+  }, [fetchState])
 
-  // Initial connection
-  useEffect(() => {
-    connect()
-
-    return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close()
-        eventSourceRef.current = null
-      }
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current)
-        reconnectTimeoutRef.current = null
-      }
+  // Start polling
+  const startPolling = useCallback(() => {
+    // Clear any existing interval
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current)
     }
-  }, [connect])
 
-  // Reconnect when tab becomes visible
+    // Determine interval based on visibility
+    const interval = isVisibleRef.current ? POLL_INTERVAL_ACTIVE : POLL_INTERVAL_HIDDEN
+
+    pollIntervalRef.current = setInterval(() => {
+      // Only poll if not in error state (too many failures)
+      if (consecutiveErrorsRef.current < maxConsecutiveErrors) {
+        fetchState()
+      }
+    }, interval)
+  }, [fetchState])
+
+  // Reconnect function - resets error count and restarts polling
+  const reconnect = useCallback(() => {
+    consecutiveErrorsRef.current = 0
+    setConnectionStatus('connecting')
+    fetchState().then(() => {
+      startPolling()
+    })
+  }, [fetchState, startPolling])
+
+  // Handle visibility changes - pause/resume polling
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && connectionStatus === 'disconnected') {
-        reconnect()
+      isVisibleRef.current = document.visibilityState === 'visible'
+      
+      if (isVisibleRef.current) {
+        // Tab became visible - fetch immediately and restart with faster polling
+        consecutiveErrorsRef.current = 0 // Reset errors on visibility
+        setConnectionStatus('connecting')
+        fetchState()
+        startPolling()
+      } else {
+        // Tab hidden - switch to slower polling
+        startPolling()
       }
     }
 
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
-  }, [connectionStatus, reconnect])
+  }, [fetchState, startPolling])
+
+  // Initial fetch and start polling
+  useEffect(() => {
+    // Initial fetch
+    fetchState()
+    
+    // Start polling
+    startPolling()
+
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current)
+        pollIntervalRef.current = null
+      }
+    }
+  }, [fetchState, startPolling])
 
   return {
     gameState,
     queueState,
     connectionStatus,
     reconnect,
+    refresh,
   }
 }
