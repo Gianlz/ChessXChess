@@ -1,6 +1,8 @@
 import { NextRequest } from 'next/server'
 import { gameStore } from '@/lib/gameStore'
+import { Chess } from 'chess.js'
 import { isRedisAvailable } from '@/lib/redis'
+import { refreshSnapshot, getSnapshot } from '@/lib/gameSnapshot'
 import { withRateLimit, secureJsonResponse, getClientIdentifier } from '@/lib/security'
 import {
   validatePlayerId,
@@ -21,13 +23,17 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const [gameState, queueState] = await Promise.all([
-      gameStore.getGameState(),
-      gameStore.getQueueState(),
-    ])
+    const snapshot = getSnapshot()
+    if (!snapshot) {
+      return secureJsonResponse(
+        { game: null, queue: null, stale: true },
+        200,
+        rateLimitResult.headers
+      )
+    }
     
     return secureJsonResponse(
-      { game: gameState, queue: queueState },
+      { game: snapshot.game, queue: snapshot.queue },
       200,
       rateLimitResult.headers
     )
@@ -106,6 +112,9 @@ export async function POST(request: NextRequest) {
           { id: playerId, name: playerName, joinedAt: Date.now() },
           color
         )
+        if (success) {
+          await refreshSnapshot()
+        }
         return secureJsonResponse({ success }, 200, headers)
       } catch {
         return secureJsonResponse(
@@ -122,6 +131,7 @@ export async function POST(request: NextRequest) {
         return secureJsonResponse({ error: 'Invalid player ID' }, 400, headers)
       }
       await gameStore.leaveQueue(playerId)
+      await refreshSnapshot()
       return secureJsonResponse({ success: true }, 200, headers)
     }
 
@@ -149,6 +159,9 @@ export async function POST(request: NextRequest) {
       }
 
       const result = await gameStore.makeMove(playerId, from, to, promotion)
+      if (result.success) {
+        await refreshSnapshot()
+      }
       return secureJsonResponse(result, result.success ? 200 : 400, headers)
     }
 
@@ -164,6 +177,7 @@ export async function POST(request: NextRequest) {
       }
 
       await gameStore.resetGame()
+      await refreshSnapshot()
       return secureJsonResponse({ success: true }, 200, headers)
     }
 
@@ -179,6 +193,7 @@ export async function POST(request: NextRequest) {
       }
 
       await gameStore.clearAllQueues()
+      await refreshSnapshot()
       return secureJsonResponse({ success: true, message: 'All queues cleared and game reset' }, 200, headers)
     }
 
@@ -198,6 +213,9 @@ export async function POST(request: NextRequest) {
         return secureJsonResponse({ error: 'Invalid player name' }, 400, headers)
       }
       const found = await gameStore.kickPlayerByName(name)
+      if (found) {
+        await refreshSnapshot()
+      }
       return secureJsonResponse(
         { success: found, message: found ? `Player ${name} removed` : `Player ${name} not found` },
         200,
@@ -210,7 +228,19 @@ export async function POST(request: NextRequest) {
       if (!from) {
         return secureJsonResponse({ error: 'Invalid square' }, 400, headers)
       }
-      const moves = await gameStore.getValidMoves(from)
+      const snapshot = getSnapshot()
+      if (!snapshot) {
+        return secureJsonResponse({ moves: [] }, 200, headers)
+      }
+
+      const chess = new Chess()
+      try {
+        chess.load(snapshot.game.fen)
+      } catch {
+        return secureJsonResponse({ moves: [] }, 200, headers)
+      }
+
+      const moves = chess.moves({ square: from, verbose: true })
       return secureJsonResponse({ moves }, 200, headers)
     }
 
@@ -220,6 +250,9 @@ export async function POST(request: NextRequest) {
         return secureJsonResponse({ error: 'Invalid player ID' }, 400, headers)
       }
       const result = await gameStore.confirmReady(playerId)
+      if (result.success) {
+        await refreshSnapshot()
+      }
       return secureJsonResponse(result, result.success ? 200 : 400, headers)
     }
 

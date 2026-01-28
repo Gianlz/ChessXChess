@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server'
-import { gameStore } from '@/lib/gameStore'
+import { getSnapshot, subscribeToSnapshot } from '@/lib/gameSnapshot'
 import { getClientIdentifier } from '@/lib/security'
 import { checkRateLimit } from '@/lib/ratelimit'
 
@@ -26,9 +26,8 @@ export async function GET(request: NextRequest) {
   }
 
   const encoder = new TextEncoder()
-  let lastVersion = -1
   let isActive = true
-  let pollTimeout: NodeJS.Timeout | null = null
+  let unsubscribe: (() => void) | null = null
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -41,64 +40,16 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      // Send initial state immediately
-      try {
-        const [gameState, queueState, version] = await Promise.all([
-          gameStore.getGameState(),
-          gameStore.getQueueState(),
-          gameStore.getVersion(),
-        ])
-        lastVersion = version
-        sendEvent({ game: gameState, queue: queueState })
-      } catch {
-        sendEvent({ error: 'Failed to get initial state' })
+      // Send initial state immediately if available (no Redis read here)
+      const snapshot = getSnapshot()
+      if (snapshot) {
+        sendEvent({ game: snapshot.game, queue: snapshot.queue })
       }
 
-      // Adaptive poll: start fast, back off when idle
-      let pollDelayMs = 200  // Start faster for better responsiveness
-      let idleStreak = 0
-      const maxPollDelayMs = 2000  // Max 2 seconds when idle
-      const idleThreshold = 5
-
-      const schedulePoll = () => {
+      unsubscribe = subscribeToSnapshot((nextSnapshot) => {
         if (!isActive) return
-        
-        pollTimeout = setTimeout(async () => {
-          if (!isActive) return
-
-          try {
-            // Check and expire any timed-out turns
-            await gameStore.checkAndExpireTurns()
-            
-            const currentVersion = await gameStore.getVersion()
-
-            if (currentVersion !== lastVersion) {
-              lastVersion = currentVersion
-              idleStreak = 0
-              pollDelayMs = 500
-
-              const [gameState, queueState] = await Promise.all([
-                gameStore.getGameState(),
-                gameStore.getQueueState(),
-              ])
-
-              sendEvent({ game: gameState, queue: queueState })
-            } else {
-              idleStreak += 1
-              if (idleStreak >= idleThreshold) {
-                pollDelayMs = Math.min(maxPollDelayMs, pollDelayMs * 2)
-                idleStreak = 0
-              }
-            }
-          } catch {
-            // Silent fail - don't spam errors
-          } finally {
-            schedulePoll()
-          }
-        }, pollDelayMs)
-      }
-
-      schedulePoll()
+        sendEvent({ game: nextSnapshot.game, queue: nextSnapshot.queue })
+      })
 
       // Heartbeat every 30 seconds to keep connection alive
       const heartbeatInterval = setInterval(() => {
@@ -116,14 +67,14 @@ export async function GET(request: NextRequest) {
       // Cleanup on close
       request.signal.addEventListener('abort', () => {
         isActive = false
-        if (pollTimeout) clearTimeout(pollTimeout)
+        if (unsubscribe) unsubscribe()
         clearInterval(heartbeatInterval)
       })
 
       // Clean up before Vercel timeout
       setTimeout(() => {
         isActive = false
-        if (pollTimeout) clearTimeout(pollTimeout)
+        if (unsubscribe) unsubscribe()
         clearInterval(heartbeatInterval)
         try {
           controller.close()
@@ -134,6 +85,7 @@ export async function GET(request: NextRequest) {
     },
     cancel() {
       isActive = false
+      if (unsubscribe) unsubscribe()
     }
   })
 
