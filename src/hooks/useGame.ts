@@ -220,12 +220,23 @@ export function useGame(): UseGameReturn {
   }, [playerId, canPlay, refreshState])
 
   const resetGame = useCallback(async () => {
+    // Reset now requires admin password
+    const pass = prompt('Enter admin password to reset game:')
+    if (!pass) {
+      setError('Reset cancelled')
+      return
+    }
     try {
-      await fetch('/api/game', {
+      const response = await fetch('/api/game', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'reset' }),
+        body: JSON.stringify({ action: 'reset', pass }),
       })
+      const data = await response.json()
+      if (!response.ok) {
+        setError(data.error || 'Failed to reset game')
+        return
+      }
       await refreshState()
     } catch {
       setError('Failed to reset game')

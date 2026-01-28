@@ -1,59 +1,37 @@
-import { NextResponse } from 'next/server'
-import { getRedis, isRedisAvailable, REDIS_KEYS } from '@/lib/redis'
+import { NextRequest } from 'next/server'
+import { isRedisAvailable } from '@/lib/redis'
+import { secureJsonResponse } from '@/lib/security'
+import { validateAdminPassword } from '@/lib/validation'
 
 export const dynamic = 'force-dynamic'
 
-export async function GET() {
-  const redis = getRedis()
-  const available = isRedisAvailable()
-  
-  const result: Record<string, unknown> = {
+export async function GET(request: NextRequest) {
+  const url = new URL(request.url)
+  const pass = url.searchParams.get('pass')
+  const isAdmin = pass ? validateAdminPassword(pass) : false
+
+  // Basic health check - always available
+  const basicHealth = {
+    status: 'ok',
     timestamp: new Date().toISOString(),
-    redisAvailable: available,
+    redisAvailable: isRedisAvailable(),
+  }
+
+  // If not admin, return only basic health
+  if (!isAdmin) {
+    return secureJsonResponse(basicHealth)
+  }
+
+  // Admin gets more details (but still no sensitive data)
+  const detailedHealth = {
+    ...basicHealth,
     envVars: {
-      urlPresent: !!process.env.UPSTASH_REDIS_REST_URL,
-      tokenPresent: !!process.env.UPSTASH_REDIS_REST_TOKEN,
+      redisConfigured: !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN),
+      adminConfigured: !!(process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.length >= 8),
     },
+    version: process.env.npm_package_version || 'unknown',
+    nodeEnv: process.env.NODE_ENV || 'unknown',
   }
 
-  if (redis) {
-    try {
-      // Test write
-      const testKey = 'chess:health:test'
-      const testValue = `health-check-${Date.now()}`
-      await redis.set(testKey, testValue)
-      
-      // Test read
-      const readValue = await redis.get(testKey)
-      
-      // Clean up
-      await redis.del(testKey)
-      
-      result.writeTest = 'success'
-      result.readTest = readValue === testValue ? 'success' : 'mismatch'
-      result.testValue = { written: testValue, read: readValue }
-      
-      // Get current game state keys
-      const [version, whiteQueue, blackQueue, currentWhite, currentBlack] = await Promise.all([
-        redis.get(REDIS_KEYS.VERSION),
-        redis.get(REDIS_KEYS.WHITE_QUEUE),
-        redis.get(REDIS_KEYS.BLACK_QUEUE),
-        redis.get(REDIS_KEYS.CURRENT_WHITE),
-        redis.get(REDIS_KEYS.CURRENT_BLACK),
-      ])
-      
-      result.gameState = {
-        version,
-        whiteQueue,
-        blackQueue,
-        currentWhite,
-        currentBlack,
-      }
-    } catch (err) {
-      result.error = err instanceof Error ? err.message : 'Unknown error'
-      result.errorStack = err instanceof Error ? err.stack : undefined
-    }
-  }
-
-  return NextResponse.json(result)
+  return secureJsonResponse(detailedHealth)
 }

@@ -197,76 +197,8 @@ class InMemoryStore {
   }
 }
 
-// Redis-backed store for production
+// Redis-backed store for production with batched operations
 class RedisStore {
-  private async getPersistedGame(): Promise<PersistedGameState | null> {
-    const redis = getRedis()
-    if (!redis) {
-      console.log('[Redis] getPersistedGame: no redis client')
-      return null
-    }
-    const result = await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
-    console.log('[Redis] getPersistedGame result:', result ? 'found' : 'null')
-    return result
-  }
-
-  private async setPersistedGame(state: PersistedGameState): Promise<void> {
-    const redis = getRedis()
-    if (!redis) {
-      throw new Error('Redis not available for setPersistedGame')
-    }
-    console.log('[Redis] setPersistedGame:', state.fen)
-    await redis.set(REDIS_KEYS.GAME_STATE, state)
-  }
-
-  private async getQueue(color: 'w' | 'b'): Promise<Player[]> {
-    const redis = getRedis()
-    if (!redis) {
-      console.log('[Redis] getQueue: no redis client')
-      return []
-    }
-    const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
-    const queue = await redis.get<Player[]>(key)
-    console.log(`[Redis] getQueue(${color}):`, queue?.length ?? 0, 'players')
-    return queue || []
-  }
-
-  private async setQueue(color: 'w' | 'b', queue: Player[]): Promise<void> {
-    const redis = getRedis()
-    if (!redis) {
-      throw new Error('Redis not available for setQueue')
-    }
-    const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
-    console.log(`[Redis] setQueue(${color}):`, queue.length, 'players ->', key)
-    await redis.set(key, queue)
-  }
-
-  private async getCurrentPlayer(color: 'w' | 'b'): Promise<Player | null> {
-    const redis = getRedis()
-    if (!redis) {
-      console.log('[Redis] getCurrentPlayer: no redis client')
-      return null
-    }
-    const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
-    const player = await redis.get<Player>(key)
-    console.log(`[Redis] getCurrentPlayer(${color}):`, player?.name ?? 'null')
-    return player
-  }
-
-  private async setCurrentPlayer(color: 'w' | 'b', player: Player | null): Promise<void> {
-    const redis = getRedis()
-    if (!redis) {
-      throw new Error('Redis not available for setCurrentPlayer')
-    }
-    const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
-    console.log(`[Redis] setCurrentPlayer(${color}):`, player?.name ?? 'null', '->', key)
-    if (player) {
-      await redis.set(key, player)
-    } else {
-      await redis.del(key)
-    }
-  }
-
   async getVersion(): Promise<number> {
     const redis = getRedis()
     if (!redis) return 0
@@ -274,16 +206,25 @@ class RedisStore {
     return version || 0
   }
 
-  private async incrementVersion(): Promise<void> {
+  async getGameState(): Promise<GameState> {
     const redis = getRedis()
     if (!redis) {
-      throw new Error('Redis not available for incrementVersion')
+      const chess = new Chess()
+      return {
+        fen: chess.fen(),
+        turn: chess.turn(),
+        isGameOver: false,
+        isCheckmate: false,
+        isStalemate: false,
+        isDraw: false,
+        isCheck: false,
+        winner: null,
+        lastMove: null,
+        moveHistory: [],
+      }
     }
-    await redis.incr(REDIS_KEYS.VERSION)
-  }
 
-  async getGameState(): Promise<GameState> {
-    const persisted = await this.getPersistedGame()
+    const persisted = await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
     const chess = new Chess()
     
     if (persisted?.fen) {
@@ -305,33 +246,28 @@ class RedisStore {
   }
 
   async getQueueState(): Promise<QueueState> {
+    const redis = getRedis()
+    if (!redis) {
+      return {
+        whiteQueue: [],
+        blackQueue: [],
+        currentWhitePlayer: null,
+        currentBlackPlayer: null,
+      }
+    }
+
     const [whiteQueue, blackQueue, currentWhitePlayer, currentBlackPlayer] = await Promise.all([
-      this.getQueue('w'),
-      this.getQueue('b'),
-      this.getCurrentPlayer('w'),
-      this.getCurrentPlayer('b'),
+      redis.get<Player[]>(REDIS_KEYS.WHITE_QUEUE),
+      redis.get<Player[]>(REDIS_KEYS.BLACK_QUEUE),
+      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
+      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
     ])
 
     return {
-      whiteQueue,
-      blackQueue,
-      currentWhitePlayer,
-      currentBlackPlayer,
-    }
-  }
-
-  private async assignNextPlayer(color: 'w' | 'b'): Promise<void> {
-    console.log(`[Redis] assignNextPlayer(${color}): starting`)
-    const queue = await this.getQueue(color)
-    console.log(`[Redis] assignNextPlayer(${color}): queue has ${queue.length} players`)
-    if (queue.length > 0) {
-      const nextPlayer = queue.shift()!
-      console.log(`[Redis] assignNextPlayer(${color}): assigning ${nextPlayer.name}`)
-      await this.setQueue(color, queue)
-      await this.setCurrentPlayer(color, nextPlayer)
-      console.log(`[Redis] assignNextPlayer(${color}): done`)
-    } else {
-      console.log(`[Redis] assignNextPlayer(${color}): no players in queue`)
+      whiteQueue: whiteQueue || [],
+      blackQueue: blackQueue || [],
+      currentWhitePlayer: currentWhitePlayer || null,
+      currentBlackPlayer: currentBlackPlayer || null,
     }
   }
 
@@ -341,71 +277,115 @@ class RedisStore {
       throw new Error('Redis not available - cannot join queue')
     }
 
-    console.log(`[Redis] joinQueue: ${player.name} -> ${color}`)
+    // Batch fetch relevant data
+    const queueKey = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
+    const currentKey = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
 
-    const queue = await this.getQueue(color)
-    const currentPlayer = await this.getCurrentPlayer(color)
+    const [queueData, currentPlayer] = await Promise.all([
+      redis.get<Player[]>(queueKey),
+      redis.get<Player>(currentKey),
+    ])
+
+    const queue = queueData || []
 
     // Check if already in queue or is current player
-    if (queue.some(p => p.id === player.id)) {
-      console.log(`[Redis] joinQueue: ${player.name} already in queue`)
-      return false
-    }
-    if (currentPlayer?.id === player.id) {
-      console.log(`[Redis] joinQueue: ${player.name} already current player`)
-      return false
-    }
+    if (queue.some(p => p.id === player.id)) return false
+    if (currentPlayer?.id === player.id) return false
 
     // Add to queue
     queue.push(player)
-    await this.setQueue(color, queue)
-    console.log(`[Redis] joinQueue: queue now has ${queue.length} players`)
+
+    // Batch write operations
+    const ops: Promise<unknown>[] = []
 
     // If no current player, assign from queue
-    if (!currentPlayer) {
-      console.log(`[Redis] joinQueue: no current player, assigning from queue`)
-      await this.assignNextPlayer(color)
+    if (!currentPlayer && queue.length > 0) {
+      const nextPlayer = queue.shift()!
+      ops.push(
+        redis.set(queueKey, queue),
+        redis.set(currentKey, nextPlayer)
+      )
+    } else {
+      ops.push(redis.set(queueKey, queue))
     }
 
-    await this.incrementVersion()
-    console.log(`[Redis] joinQueue: success`)
+    ops.push(redis.incr(REDIS_KEYS.VERSION))
+    await Promise.all(ops)
+
     return true
   }
 
   async leaveQueue(playerId: string): Promise<void> {
-    let whiteQueue = await this.getQueue('w')
-    let blackQueue = await this.getQueue('b')
-    const currentWhite = await this.getCurrentPlayer('w')
-    const currentBlack = await this.getCurrentPlayer('b')
+    const redis = getRedis()
+    if (!redis) return
 
-    whiteQueue = whiteQueue.filter(p => p.id !== playerId)
-    blackQueue = blackQueue.filter(p => p.id !== playerId)
+    // Batch fetch all relevant data
+    const [whiteQueue, blackQueue, currentWhite, currentBlack] = await Promise.all([
+      redis.get<Player[]>(REDIS_KEYS.WHITE_QUEUE),
+      redis.get<Player[]>(REDIS_KEYS.BLACK_QUEUE),
+      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
+      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
+    ])
 
-    await this.setQueue('w', whiteQueue)
-    await this.setQueue('b', blackQueue)
+    const filteredWhite = (whiteQueue || []).filter(p => p.id !== playerId)
+    const filteredBlack = (blackQueue || []).filter(p => p.id !== playerId)
 
+    const ops: Promise<unknown>[] = [
+      redis.set(REDIS_KEYS.WHITE_QUEUE, filteredWhite),
+      redis.set(REDIS_KEYS.BLACK_QUEUE, filteredBlack),
+    ]
+
+    // Handle current player removal and assignment
     if (currentWhite?.id === playerId) {
-      await this.setCurrentPlayer('w', null)
-      await this.assignNextPlayer('w')
-    }
-    if (currentBlack?.id === playerId) {
-      await this.setCurrentPlayer('b', null)
-      await this.assignNextPlayer('b')
+      if (filteredWhite.length > 0) {
+        const next = filteredWhite.shift()!
+        ops.push(
+          redis.set(REDIS_KEYS.CURRENT_WHITE, next),
+          redis.set(REDIS_KEYS.WHITE_QUEUE, filteredWhite)
+        )
+      } else {
+        ops.push(redis.del(REDIS_KEYS.CURRENT_WHITE))
+      }
     }
 
-    await this.incrementVersion()
+    if (currentBlack?.id === playerId) {
+      if (filteredBlack.length > 0) {
+        const next = filteredBlack.shift()!
+        ops.push(
+          redis.set(REDIS_KEYS.CURRENT_BLACK, next),
+          redis.set(REDIS_KEYS.BLACK_QUEUE, filteredBlack)
+        )
+      } else {
+        ops.push(redis.del(REDIS_KEYS.CURRENT_BLACK))
+      }
+    }
+
+    ops.push(redis.incr(REDIS_KEYS.VERSION))
+    await Promise.all(ops)
   }
 
   async makeMove(playerId: string, from: Square, to: Square, promotion?: string): Promise<{ success: boolean; error?: string }> {
-    const persisted = await this.getPersistedGame()
+    const redis = getRedis()
+    if (!redis) {
+      return { success: false, error: 'Redis not available' }
+    }
+
+    // Batch fetch game state and current player
+    const [persisted, currentWhite, currentBlack, whiteQueue, blackQueue] = await Promise.all([
+      redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE),
+      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
+      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
+      redis.get<Player[]>(REDIS_KEYS.WHITE_QUEUE),
+      redis.get<Player[]>(REDIS_KEYS.BLACK_QUEUE),
+    ])
+
     const chess = new Chess()
-    
     if (persisted?.fen) {
       chess.load(persisted.fen)
     }
 
     const currentTurn = chess.turn()
-    const currentPlayer = await this.getCurrentPlayer(currentTurn)
+    const currentPlayer = currentTurn === 'w' ? currentWhite : currentBlack
 
     if (currentPlayer?.id !== playerId) {
       return { success: false, error: 'Not your turn' }
@@ -413,34 +393,48 @@ class RedisStore {
 
     try {
       const move = chess.move({ from, to, promotion })
-      if (move) {
-        // Save game state
-        await this.setPersistedGame({
+      if (!move) {
+        return { success: false, error: 'Invalid move' }
+      }
+
+      // Prepare batch write operations
+      const queue = currentTurn === 'w' ? (whiteQueue || []) : (blackQueue || [])
+      queue.push(currentPlayer)
+
+      // Assign next player
+      let nextPlayer: Player | null = null
+      if (queue.length > 0) {
+        nextPlayer = queue.shift()!
+      }
+
+      const queueKey = currentTurn === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
+      const currentKey = currentTurn === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
+
+      const ops: Promise<unknown>[] = [
+        redis.set(REDIS_KEYS.GAME_STATE, {
           fen: chess.fen(),
           lastMove: { from, to },
           moveHistory: chess.history(),
-        })
-        
-        // Move current player to back of queue
-        const queue = await this.getQueue(currentTurn)
-        queue.push(currentPlayer)
-        await this.setQueue(currentTurn, queue)
-        
-        // Assign next player
-        await this.setCurrentPlayer(currentTurn, null)
-        await this.assignNextPlayer(currentTurn)
+        }),
+        redis.set(queueKey, queue),
+        nextPlayer ? redis.set(currentKey, nextPlayer) : redis.del(currentKey),
+        redis.incr(REDIS_KEYS.VERSION),
+      ]
 
-        await this.incrementVersion()
-        return { success: true }
-      }
-      return { success: false, error: 'Invalid move' }
+      await Promise.all(ops)
+      return { success: true }
     } catch {
       return { success: false, error: 'Invalid move' }
     }
   }
 
   async getValidMoves(square: Square): Promise<Move[]> {
-    const persisted = await this.getPersistedGame()
+    const redis = getRedis()
+    if (!redis) {
+      return new Chess().moves({ square, verbose: true })
+    }
+
+    const persisted = await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
     const chess = new Chess()
     
     if (persisted?.fen) {
@@ -451,66 +445,98 @@ class RedisStore {
   }
 
   async resetGame(): Promise<void> {
-    await this.setPersistedGame({
-      fen: new Chess().fen(),
-      lastMove: null,
-      moveHistory: [],
-    })
-    await this.incrementVersion()
+    const redis = getRedis()
+    if (!redis) return
+
+    await Promise.all([
+      redis.set(REDIS_KEYS.GAME_STATE, {
+        fen: new Chess().fen(),
+        lastMove: null,
+        moveHistory: [],
+      }),
+      redis.incr(REDIS_KEYS.VERSION),
+    ])
   }
 
   async clearAllQueues(): Promise<void> {
-    await this.setQueue('w', [])
-    await this.setQueue('b', [])
-    await this.setCurrentPlayer('w', null)
-    await this.setCurrentPlayer('b', null)
-    await this.setPersistedGame({
-      fen: new Chess().fen(),
-      lastMove: null,
-      moveHistory: [],
-    })
-    await this.incrementVersion()
+    const redis = getRedis()
+    if (!redis) return
+
+    await Promise.all([
+      redis.set(REDIS_KEYS.WHITE_QUEUE, []),
+      redis.set(REDIS_KEYS.BLACK_QUEUE, []),
+      redis.del(REDIS_KEYS.CURRENT_WHITE),
+      redis.del(REDIS_KEYS.CURRENT_BLACK),
+      redis.set(REDIS_KEYS.GAME_STATE, {
+        fen: new Chess().fen(),
+        lastMove: null,
+        moveHistory: [],
+      }),
+      redis.incr(REDIS_KEYS.VERSION),
+    ])
   }
 
   async kickPlayerByName(playerName: string): Promise<boolean> {
+    const redis = getRedis()
+    if (!redis) return false
+
+    // Batch fetch all data
+    const [whiteQueue, blackQueue, currentWhite, currentBlack] = await Promise.all([
+      redis.get<Player[]>(REDIS_KEYS.WHITE_QUEUE),
+      redis.get<Player[]>(REDIS_KEYS.BLACK_QUEUE),
+      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
+      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
+    ])
+
     let found = false
-    
-    // Check white queue
-    let whiteQueue = await this.getQueue('w')
-    const whiteFiltered = whiteQueue.filter(p => p.name !== playerName)
-    if (whiteFiltered.length !== whiteQueue.length) {
+    const ops: Promise<unknown>[] = []
+
+    // Filter queues
+    const whiteFiltered = (whiteQueue || []).filter(p => p.name !== playerName)
+    const blackFiltered = (blackQueue || []).filter(p => p.name !== playerName)
+
+    if (whiteFiltered.length !== (whiteQueue || []).length) {
       found = true
-      await this.setQueue('w', whiteFiltered)
+      ops.push(redis.set(REDIS_KEYS.WHITE_QUEUE, whiteFiltered))
     }
-    
-    // Check black queue
-    let blackQueue = await this.getQueue('b')
-    const blackFiltered = blackQueue.filter(p => p.name !== playerName)
-    if (blackFiltered.length !== blackQueue.length) {
+
+    if (blackFiltered.length !== (blackQueue || []).length) {
       found = true
-      await this.setQueue('b', blackFiltered)
+      ops.push(redis.set(REDIS_KEYS.BLACK_QUEUE, blackFiltered))
     }
-    
-    // Check current white player
-    const currentWhite = await this.getCurrentPlayer('w')
+
+    // Check current players
     if (currentWhite?.name === playerName) {
       found = true
-      await this.setCurrentPlayer('w', null)
-      await this.assignNextPlayer('w')
+      if (whiteFiltered.length > 0) {
+        const next = whiteFiltered.shift()!
+        ops.push(
+          redis.set(REDIS_KEYS.CURRENT_WHITE, next),
+          redis.set(REDIS_KEYS.WHITE_QUEUE, whiteFiltered)
+        )
+      } else {
+        ops.push(redis.del(REDIS_KEYS.CURRENT_WHITE))
+      }
     }
-    
-    // Check current black player
-    const currentBlack = await this.getCurrentPlayer('b')
+
     if (currentBlack?.name === playerName) {
       found = true
-      await this.setCurrentPlayer('b', null)
-      await this.assignNextPlayer('b')
+      if (blackFiltered.length > 0) {
+        const next = blackFiltered.shift()!
+        ops.push(
+          redis.set(REDIS_KEYS.CURRENT_BLACK, next),
+          redis.set(REDIS_KEYS.BLACK_QUEUE, blackFiltered)
+        )
+      } else {
+        ops.push(redis.del(REDIS_KEYS.CURRENT_BLACK))
+      }
     }
-    
+
     if (found) {
-      await this.incrementVersion()
+      ops.push(redis.incr(REDIS_KEYS.VERSION))
+      await Promise.all(ops)
     }
-    
+
     return found
   }
 }

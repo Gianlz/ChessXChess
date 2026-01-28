@@ -1,11 +1,30 @@
 import { NextRequest } from 'next/server'
 import { gameStore } from '@/lib/gameStore'
+import { getClientIdentifier } from '@/lib/security'
+import { checkRateLimit } from '@/lib/ratelimit'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
-export const maxDuration = 60 // Vercel serverless function timeout
+export const maxDuration = 60
 
 export async function GET(request: NextRequest) {
+  // Rate limit check for stream connections
+  const clientId = getClientIdentifier(request)
+  const rateLimitResult = await checkRateLimit(clientId, 'general')
+  
+  if (!rateLimitResult.success) {
+    return new Response(
+      JSON.stringify({ error: 'Too many connections. Please wait.' }),
+      {
+        status: 429,
+        headers: {
+          'Content-Type': 'application/json',
+          'Retry-After': Math.ceil((rateLimitResult.reset - Date.now()) / 1000).toString(),
+        },
+      }
+    )
+  }
+
   const encoder = new TextEncoder()
   let lastVersion = -1
   let isActive = true
@@ -14,6 +33,7 @@ export async function GET(request: NextRequest) {
   const stream = new ReadableStream({
     async start(controller) {
       const sendEvent = (data: object) => {
+        if (!isActive) return
         try {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`))
         } catch {
@@ -30,8 +50,7 @@ export async function GET(request: NextRequest) {
         ])
         lastVersion = version
         sendEvent({ game: gameState, queue: queueState })
-      } catch (err) {
-        console.error('Stream initial state error:', err)
+      } catch {
         sendEvent({ error: 'Failed to get initial state' })
       }
 
@@ -42,13 +61,10 @@ export async function GET(request: NextRequest) {
       const idleThreshold = 3
 
       const schedulePoll = () => {
-        if (!isActive) {
-          return
-        }
+        if (!isActive) return
+        
         pollTimeout = setTimeout(async () => {
-          if (!isActive) {
-            return
-          }
+          if (!isActive) return
 
           try {
             const currentVersion = await gameStore.getVersion()
@@ -71,8 +87,8 @@ export async function GET(request: NextRequest) {
                 idleStreak = 0
               }
             }
-          } catch (err) {
-            console.error('Stream poll error:', err)
+          } catch {
+            // Silent fail - don't spam errors
           } finally {
             schedulePoll()
           }
@@ -97,18 +113,14 @@ export async function GET(request: NextRequest) {
       // Cleanup on close
       request.signal.addEventListener('abort', () => {
         isActive = false
-        if (pollTimeout) {
-          clearTimeout(pollTimeout)
-        }
+        if (pollTimeout) clearTimeout(pollTimeout)
         clearInterval(heartbeatInterval)
       })
 
       // Clean up before Vercel timeout
       setTimeout(() => {
         isActive = false
-        if (pollTimeout) {
-          clearTimeout(pollTimeout)
-        }
+        if (pollTimeout) clearTimeout(pollTimeout)
         clearInterval(heartbeatInterval)
         try {
           controller.close()
@@ -128,6 +140,8 @@ export async function GET(request: NextRequest) {
       'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
     },
   })
 }
