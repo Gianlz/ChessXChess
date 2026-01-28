@@ -1,6 +1,5 @@
 import { NextRequest } from 'next/server'
 import { gameStore } from '@/lib/gameStore'
-import { isRedisAvailable } from '@/lib/redis'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -10,6 +9,7 @@ export async function GET(request: NextRequest) {
   const encoder = new TextEncoder()
   let lastVersion = -1
   let isActive = true
+  let pollTimeout: NodeJS.Timeout | null = null
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -35,30 +35,51 @@ export async function GET(request: NextRequest) {
         sendEvent({ error: 'Failed to get initial state' })
       }
 
-      // Poll for updates every 500ms
-      const pollInterval = setInterval(async () => {
+      // Adaptive poll: start fast, back off when idle
+      let pollDelayMs = 500
+      let idleStreak = 0
+      const maxPollDelayMs = 5000
+      const idleThreshold = 3
+
+      const schedulePoll = () => {
         if (!isActive) {
-          clearInterval(pollInterval)
           return
         }
-
-        try {
-          const currentVersion = await gameStore.getVersion()
-          
-          if (currentVersion !== lastVersion) {
-            lastVersion = currentVersion
-            
-            const [gameState, queueState] = await Promise.all([
-              gameStore.getGameState(),
-              gameStore.getQueueState(),
-            ])
-            
-            sendEvent({ game: gameState, queue: queueState })
+        pollTimeout = setTimeout(async () => {
+          if (!isActive) {
+            return
           }
-        } catch (err) {
-          console.error('Stream poll error:', err)
-        }
-      }, 500)
+
+          try {
+            const currentVersion = await gameStore.getVersion()
+
+            if (currentVersion !== lastVersion) {
+              lastVersion = currentVersion
+              idleStreak = 0
+              pollDelayMs = 500
+
+              const [gameState, queueState] = await Promise.all([
+                gameStore.getGameState(),
+                gameStore.getQueueState(),
+              ])
+
+              sendEvent({ game: gameState, queue: queueState })
+            } else {
+              idleStreak += 1
+              if (idleStreak >= idleThreshold) {
+                pollDelayMs = Math.min(maxPollDelayMs, pollDelayMs * 2)
+                idleStreak = 0
+              }
+            }
+          } catch (err) {
+            console.error('Stream poll error:', err)
+          } finally {
+            schedulePoll()
+          }
+        }, pollDelayMs)
+      }
+
+      schedulePoll()
 
       // Heartbeat every 30 seconds to keep connection alive
       const heartbeatInterval = setInterval(() => {
@@ -76,14 +97,18 @@ export async function GET(request: NextRequest) {
       // Cleanup on close
       request.signal.addEventListener('abort', () => {
         isActive = false
-        clearInterval(pollInterval)
+        if (pollTimeout) {
+          clearTimeout(pollTimeout)
+        }
         clearInterval(heartbeatInterval)
       })
 
       // Clean up before Vercel timeout
       setTimeout(() => {
         isActive = false
-        clearInterval(pollInterval)
+        if (pollTimeout) {
+          clearTimeout(pollTimeout)
+        }
         clearInterval(heartbeatInterval)
         try {
           controller.close()

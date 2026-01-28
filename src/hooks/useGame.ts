@@ -53,63 +53,22 @@ export function useGame(): UseGameReturn {
     }
   }, [])
 
-  // Connect to SSE stream with auto-reconnect
-  useEffect(() => {
-    let eventSource: EventSource | null = null
-    let reconnectTimeout: NodeJS.Timeout | null = null
-    let isUnmounted = false
-
-    const connect = () => {
-      if (isUnmounted) return
-      
-      eventSource = new EventSource('/api/stream')
-
-      eventSource.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data)
-          setGameState(data.game)
-          setQueueState(data.queue)
-          setError(null)
-        } catch {
-          // Ignore parse errors (heartbeats)
-        }
-      }
-
-      eventSource.onerror = () => {
-        if (isUnmounted) return
-        
-        eventSource?.close()
-        
-        // Fetch current state immediately to avoid missing updates
-        fetch('/api/game')
-          .then(r => r.json())
-          .then(data => {
-            if (!isUnmounted) {
-              setGameState(data.game)
-              setQueueState(data.queue)
-            }
-          })
-          .catch(() => {})
-        
-        // Reconnect after a short delay
-        reconnectTimeout = setTimeout(() => {
-          if (!isUnmounted) {
-            connect()
-          }
-        }, 1000)
-      }
-    }
-
-    connect()
-
-    return () => {
-      isUnmounted = true
-      eventSource?.close()
-      if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout)
-      }
+  const refreshState = useCallback(async () => {
+    try {
+      const response = await fetch('/api/game')
+      const data = await response.json()
+      setGameState(data.game)
+      setQueueState(data.queue)
+      setError(null)
+    } catch {
+      setError('Failed to load game state')
     }
   }, [])
+
+  // Load state once on mount
+  useEffect(() => {
+    refreshState()
+  }, [refreshState])
 
   // Update player color based on queue state
   useEffect(() => {
@@ -163,11 +122,13 @@ export function useGame(): UseGameReturn {
       const data = await response.json()
       if (!data.success) {
         setError('Failed to join queue')
+      } else {
+        await refreshState()
       }
     } catch {
       setError('Failed to join queue')
     }
-  }, [playerId, playerName])
+  }, [playerId, playerName, refreshState])
 
   const leaveQueue = useCallback(async () => {
     if (!playerId) return
@@ -183,10 +144,11 @@ export function useGame(): UseGameReturn {
       })
       setSelectedSquare(null)
       setValidMoves([])
+      await refreshState()
     } catch {
       setError('Failed to leave queue')
     }
-  }, [playerId])
+  }, [playerId, refreshState])
 
   const fetchValidMoves = useCallback(async (square: Square): Promise<Move[]> => {
     try {
@@ -245,6 +207,7 @@ export function useGame(): UseGameReturn {
       if (data.success) {
         setSelectedSquare(null)
         setValidMoves([])
+        await refreshState()
         return true
       } else {
         setError(data.error || 'Invalid move')
@@ -254,7 +217,7 @@ export function useGame(): UseGameReturn {
       setError('Failed to make move')
       return false
     }
-  }, [playerId, canPlay])
+  }, [playerId, canPlay, refreshState])
 
   const resetGame = useCallback(async () => {
     try {
@@ -263,10 +226,11 @@ export function useGame(): UseGameReturn {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'reset' }),
       })
+      await refreshState()
     } catch {
       setError('Failed to reset game')
     }
-  }, [])
+  }, [refreshState])
 
   // Clear error after timeout
   useEffect(() => {
