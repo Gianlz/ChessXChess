@@ -1,5 +1,5 @@
 import { Chess, Square, Move } from 'chess.js'
-import { redis, REDIS_KEYS } from './redis'
+import { getRedis, isRedisAvailable, REDIS_KEYS } from './redis'
 
 export interface Player {
   id: string
@@ -163,53 +163,97 @@ class InMemoryStore {
 // Redis-backed store for production
 class RedisStore {
   private async getPersistedGame(): Promise<PersistedGameState | null> {
+    const redis = getRedis()
     if (!redis) return null
-    return await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
+    try {
+      return await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
+    } catch (err) {
+      console.error('Redis getPersistedGame error:', err)
+      return null
+    }
   }
 
   private async setPersistedGame(state: PersistedGameState): Promise<void> {
+    const redis = getRedis()
     if (!redis) return
-    await redis.set(REDIS_KEYS.GAME_STATE, state)
+    try {
+      await redis.set(REDIS_KEYS.GAME_STATE, state)
+    } catch (err) {
+      console.error('Redis setPersistedGame error:', err)
+    }
   }
 
   private async getQueue(color: 'w' | 'b'): Promise<Player[]> {
+    const redis = getRedis()
     if (!redis) return []
-    const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
-    const queue = await redis.get<Player[]>(key)
-    return queue || []
+    try {
+      const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
+      const queue = await redis.get<Player[]>(key)
+      return queue || []
+    } catch (err) {
+      console.error('Redis getQueue error:', err)
+      return []
+    }
   }
 
   private async setQueue(color: 'w' | 'b', queue: Player[]): Promise<void> {
+    const redis = getRedis()
     if (!redis) return
-    const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
-    await redis.set(key, queue)
+    try {
+      const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
+      await redis.set(key, queue)
+    } catch (err) {
+      console.error('Redis setQueue error:', err)
+    }
   }
 
   private async getCurrentPlayer(color: 'w' | 'b'): Promise<Player | null> {
+    const redis = getRedis()
     if (!redis) return null
-    const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
-    return await redis.get<Player>(key)
+    try {
+      const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
+      return await redis.get<Player>(key)
+    } catch (err) {
+      console.error('Redis getCurrentPlayer error:', err)
+      return null
+    }
   }
 
   private async setCurrentPlayer(color: 'w' | 'b', player: Player | null): Promise<void> {
+    const redis = getRedis()
     if (!redis) return
-    const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
-    if (player) {
-      await redis.set(key, player)
-    } else {
-      await redis.del(key)
+    try {
+      const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
+      if (player) {
+        await redis.set(key, player)
+      } else {
+        await redis.del(key)
+      }
+    } catch (err) {
+      console.error('Redis setCurrentPlayer error:', err)
     }
   }
 
   async getVersion(): Promise<number> {
+    const redis = getRedis()
     if (!redis) return 0
-    const version = await redis.get<number>(REDIS_KEYS.VERSION)
-    return version || 0
+    try {
+      const version = await redis.get<number>(REDIS_KEYS.VERSION)
+      return version || 0
+    } catch (err) {
+      console.error('Redis getVersion error:', err)
+      return 0
+    }
   }
 
   private async incrementVersion(): Promise<void> {
+    const redis = getRedis()
     if (!redis) return
-    await redis.incr(REDIS_KEYS.VERSION)
+    try {
+      await redis.incr(REDIS_KEYS.VERSION)
+    } catch (err) {
+      console.error('Redis incrementVersion error:', err)
+    }
   }
 
   async getGameState(): Promise<GameState> {
@@ -260,6 +304,11 @@ class RedisStore {
   }
 
   async joinQueue(player: Player, color: 'w' | 'b'): Promise<boolean> {
+    const redis = getRedis()
+    if (!redis) {
+      throw new Error('Redis not available - cannot join queue')
+    }
+
     const queue = await this.getQueue(color)
     const currentPlayer = await this.getCurrentPlayer(color)
 
@@ -365,62 +414,62 @@ class RedisStore {
   }
 }
 
-// Use Redis if available, otherwise fall back to in-memory
+// Singleton instances
 const inMemoryStore = new InMemoryStore()
 const redisStore = new RedisStore()
 
 export const gameStore = {
   async getGameState(): Promise<GameState> {
-    if (redis) {
+    if (isRedisAvailable()) {
       return await redisStore.getGameState()
     }
     return inMemoryStore.getGameState()
   },
 
   async getQueueState(): Promise<QueueState> {
-    if (redis) {
+    if (isRedisAvailable()) {
       return await redisStore.getQueueState()
     }
     return inMemoryStore.getQueueState()
   },
 
   async getVersion(): Promise<number> {
-    if (redis) {
+    if (isRedisAvailable()) {
       return await redisStore.getVersion()
     }
     return inMemoryStore.getVersion()
   },
 
   async joinQueue(player: Player, color: 'w' | 'b'): Promise<boolean> {
-    if (redis) {
+    if (isRedisAvailable()) {
       return await redisStore.joinQueue(player, color)
     }
     return inMemoryStore.joinQueue(player, color)
   },
 
   async leaveQueue(playerId: string): Promise<void> {
-    if (redis) {
+    if (isRedisAvailable()) {
       return await redisStore.leaveQueue(playerId)
     }
     return inMemoryStore.leaveQueue(playerId)
   },
 
   async makeMove(playerId: string, from: Square, to: Square, promotion?: string): Promise<{ success: boolean; error?: string }> {
-    if (redis) {
+    if (isRedisAvailable()) {
       return await redisStore.makeMove(playerId, from, to, promotion)
     }
     return inMemoryStore.makeMove(playerId, from, to, promotion)
   },
 
   async getValidMoves(square: Square): Promise<Move[]> {
-    if (redis) {
+    if (isRedisAvailable()) {
       return await redisStore.getValidMoves(square)
     }
     return inMemoryStore.getValidMoves(square)
   },
 
   async resetGame(): Promise<void> {
-    if (redis) {
+    if (isRedisAvailable()) {
       return await redisStore.resetGame()
     }
     return inMemoryStore.resetGame()

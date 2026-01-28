@@ -1,65 +1,93 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { gameStore } from '@/lib/gameStore'
 import { Square } from 'chess.js'
+import { isRedisAvailable } from '@/lib/redis'
 
 export async function GET() {
-  const [gameState, queueState] = await Promise.all([
-    gameStore.getGameState(),
-    gameStore.getQueueState(),
-  ])
-  
-  return NextResponse.json({
-    game: gameState,
-    queue: queueState,
-  })
+  try {
+    const [gameState, queueState] = await Promise.all([
+      gameStore.getGameState(),
+      gameStore.getQueueState(),
+    ])
+    
+    return NextResponse.json({
+      game: gameState,
+      queue: queueState,
+    })
+  } catch (err) {
+    console.error('GET /api/game error:', err)
+    return NextResponse.json(
+      { error: 'Failed to get game state', details: err instanceof Error ? err.message : 'Unknown error' },
+      { status: 500 }
+    )
+  }
 }
 
 export async function POST(request: NextRequest) {
-  const body = await request.json()
-  const { action, playerId, playerName, color, from, to, promotion } = body
+  try {
+    const body = await request.json()
+    const { action, playerId, playerName, color, from, to, promotion } = body
 
-  switch (action) {
-    case 'join': {
-      if (!playerId || !playerName || !color) {
-        return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
+    console.log(`POST /api/game action=${action} redisAvailable=${isRedisAvailable()}`)
+
+    switch (action) {
+      case 'join': {
+        if (!playerId || !playerName || !color) {
+          return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
+        }
+        
+        if (!isRedisAvailable()) {
+          console.error('Redis not available for join action')
+          return NextResponse.json(
+            { error: 'Game server not configured. Redis is required for multiplayer.', redisAvailable: false },
+            { status: 503 }
+          )
+        }
+        
+        const success = await gameStore.joinQueue(
+          { id: playerId, name: playerName, joinedAt: Date.now() },
+          color
+        )
+        return NextResponse.json({ success })
       }
-      const success = await gameStore.joinQueue(
-        { id: playerId, name: playerName, joinedAt: Date.now() },
-        color
-      )
-      return NextResponse.json({ success })
-    }
 
-    case 'leave': {
-      if (!playerId) {
-        return NextResponse.json({ error: 'Missing playerId' }, { status: 400 })
+      case 'leave': {
+        if (!playerId) {
+          return NextResponse.json({ error: 'Missing playerId' }, { status: 400 })
+        }
+        await gameStore.leaveQueue(playerId)
+        return NextResponse.json({ success: true })
       }
-      await gameStore.leaveQueue(playerId)
-      return NextResponse.json({ success: true })
-    }
 
-    case 'move': {
-      if (!playerId || !from || !to) {
-        return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
+      case 'move': {
+        if (!playerId || !from || !to) {
+          return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
+        }
+        const result = await gameStore.makeMove(playerId, from as Square, to as Square, promotion)
+        return NextResponse.json(result)
       }
-      const result = await gameStore.makeMove(playerId, from as Square, to as Square, promotion)
-      return NextResponse.json(result)
-    }
 
-    case 'reset': {
-      await gameStore.resetGame()
-      return NextResponse.json({ success: true })
-    }
-
-    case 'validMoves': {
-      if (!from) {
-        return NextResponse.json({ error: 'Missing square' }, { status: 400 })
+      case 'reset': {
+        await gameStore.resetGame()
+        return NextResponse.json({ success: true })
       }
-      const moves = await gameStore.getValidMoves(from as Square)
-      return NextResponse.json({ moves })
-    }
 
-    default:
-      return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
+      case 'validMoves': {
+        if (!from) {
+          return NextResponse.json({ error: 'Missing square' }, { status: 400 })
+        }
+        const moves = await gameStore.getValidMoves(from as Square)
+        return NextResponse.json({ moves })
+      }
+
+      default:
+        return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
+    }
+  } catch (err) {
+    console.error('POST /api/game error:', err)
+    return NextResponse.json(
+      { error: 'Server error', details: err instanceof Error ? err.message : 'Unknown error' },
+      { status: 500 }
+    )
   }
 }

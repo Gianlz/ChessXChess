@@ -1,75 +1,88 @@
+import { NextRequest } from 'next/server'
 import { gameStore } from '@/lib/gameStore'
+import { isRedisAvailable } from '@/lib/redis'
 
 export const dynamic = 'force-dynamic'
+export const runtime = 'nodejs'
 export const maxDuration = 60 // Vercel serverless function timeout
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const encoder = new TextEncoder()
-  let isClosed = false
   let lastVersion = -1
+  let isActive = true
 
   const stream = new ReadableStream({
     async start(controller) {
-      const sendUpdate = async () => {
-        if (isClosed) return
-        
+      const sendEvent = (data: object) => {
         try {
-          const [gameState, queueState] = await Promise.all([
-            gameStore.getGameState(),
-            gameStore.getQueueState(),
-          ])
-          const data = JSON.stringify({ game: gameState, queue: queueState })
-          controller.enqueue(encoder.encode(`data: ${data}\n\n`))
-        } catch (err) {
-          console.error('Error sending update:', err)
-        }
-      }
-
-      const checkForUpdates = async () => {
-        if (isClosed) return
-        
-        try {
-          const currentVersion = await gameStore.getVersion()
-          if (currentVersion !== lastVersion) {
-            lastVersion = currentVersion
-            await sendUpdate()
-          }
-        } catch (err) {
-          console.error('Error checking for updates:', err)
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`))
+        } catch {
+          isActive = false
         }
       }
 
       // Send initial state immediately
-      await sendUpdate()
-      lastVersion = await gameStore.getVersion()
+      try {
+        const [gameState, queueState, version] = await Promise.all([
+          gameStore.getGameState(),
+          gameStore.getQueueState(),
+          gameStore.getVersion(),
+        ])
+        lastVersion = version
+        sendEvent({ game: gameState, queue: queueState })
+      } catch (err) {
+        console.error('Stream initial state error:', err)
+        sendEvent({ error: 'Failed to get initial state' })
+      }
 
-      // Poll for changes every 500ms
+      // Poll for updates every 500ms
       const pollInterval = setInterval(async () => {
-        if (isClosed) {
+        if (!isActive) {
           clearInterval(pollInterval)
           return
         }
-        await checkForUpdates()
+
+        try {
+          const currentVersion = await gameStore.getVersion()
+          
+          if (currentVersion !== lastVersion) {
+            lastVersion = currentVersion
+            
+            const [gameState, queueState] = await Promise.all([
+              gameStore.getGameState(),
+              gameStore.getQueueState(),
+            ])
+            
+            sendEvent({ game: gameState, queue: queueState })
+          }
+        } catch (err) {
+          console.error('Stream poll error:', err)
+        }
       }, 500)
 
       // Heartbeat every 30 seconds to keep connection alive
       const heartbeatInterval = setInterval(() => {
-        if (isClosed) {
+        if (!isActive) {
           clearInterval(heartbeatInterval)
           return
         }
         try {
           controller.enqueue(encoder.encode(`: heartbeat\n\n`))
         } catch {
-          isClosed = true
-          clearInterval(pollInterval)
-          clearInterval(heartbeatInterval)
+          isActive = false
         }
       }, 30000)
 
-      // Clean up after max duration (slightly before Vercel timeout)
+      // Cleanup on close
+      request.signal.addEventListener('abort', () => {
+        isActive = false
+        clearInterval(pollInterval)
+        clearInterval(heartbeatInterval)
+      })
+
+      // Clean up before Vercel timeout
       setTimeout(() => {
-        isClosed = true
+        isActive = false
         clearInterval(pollInterval)
         clearInterval(heartbeatInterval)
         try {
@@ -77,10 +90,10 @@ export async function GET() {
         } catch {
           // Already closed
         }
-      }, 55000) // Close before 60s timeout
+      }, 55000)
     },
     cancel() {
-      isClosed = true
+      isActive = false
     }
   })
 
