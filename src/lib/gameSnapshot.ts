@@ -7,10 +7,10 @@ export interface GameSnapshot {
   version: number
 }
 
-type SnapshotListener = (snapshot: GameSnapshot) => void
-
+// Simple cache for the game API route
+// Note: This is instance-local, so it's just an optimization
+// The stream route polls Redis directly for reliability
 let cachedSnapshot: GameSnapshot | null = null
-const listeners = new Set<SnapshotListener>()
 
 export function getSnapshot(): GameSnapshot | null {
   return cachedSnapshot
@@ -26,18 +26,5 @@ export async function refreshSnapshot(): Promise<GameSnapshot> {
   const snapshot = { game, queue, version }
   cachedSnapshot = snapshot
 
-  listeners.forEach((listener) => {
-    try {
-      listener(snapshot)
-    } catch {
-      // Ignore listener errors
-    }
-  })
-
   return snapshot
-}
-
-export function subscribeToSnapshot(listener: SnapshotListener): () => void {
-  listeners.add(listener)
-  return () => listeners.delete(listener)
 }
