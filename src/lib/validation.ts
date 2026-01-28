@@ -92,7 +92,7 @@ export function validateAdminPassword(password: unknown): boolean {
 
 // Validate action type
 const VALID_ACTIONS: Set<string> = new Set([
-  'join', 'leave', 'move', 'reset', 'clearAll', 'kickPlayer', 'validMoves', 'confirmReady'
+  'join', 'leave', 'move', 'reset', 'clearAll', 'kickPlayer', 'confirmReady'
 ])
 
 export function validateAction(action: unknown): string | null {

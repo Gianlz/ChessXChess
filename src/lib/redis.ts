@@ -1,15 +1,8 @@
 import { Redis } from '@upstash/redis'
+import { logger } from './logger'
 
 // Lazy singleton - created on first use
 let redisClient: Redis | null | undefined = undefined
-
-// Debug logging - only in development
-const isDev = process.env.NODE_ENV === 'development'
-function debugLog(...args: unknown[]): void {
-  if (isDev) {
-    console.log('[Redis]', ...args)
-  }
-}
 
 // Get Redis client lazily
 export function getRedis(): Redis | null {
@@ -19,13 +12,14 @@ export function getRedis(): Redis | null {
     const token = process.env.UPSTASH_REDIS_REST_TOKEN
 
     if (!url || !token) {
-      debugLog('Missing environment variables')
+      logger.debug('Redis: Missing environment variables')
       redisClient = null
     } else {
       try {
         redisClient = new Redis({ url, token })
-        debugLog('Client created successfully')
-      } catch {
+        logger.debug('Redis: Client created successfully')
+      } catch (err) {
+        logger.error('Redis: Failed to create client', { error: String(err) })
         redisClient = null
       }
     }
@@ -39,14 +33,19 @@ export function isRedisAvailable(): boolean {
   return getRedis() !== null
 }
 
-// Redis keys
-export const REDIS_KEYS = {
-  GAME_STATE: 'chess:game',
-  WHITE_QUEUE: 'chess:queue:white',
-  BLACK_QUEUE: 'chess:queue:black',
-  CURRENT_WHITE: 'chess:current:white',
-  CURRENT_BLACK: 'chess:current:black',
-  TURN_WHITE: 'chess:turn:white',
-  TURN_BLACK: 'chess:turn:black',
-  VERSION: 'chess:version',
-} as const
+// Actually ping Redis to verify connection
+export async function pingRedis(): Promise<boolean> {
+  const redis = getRedis()
+  if (!redis) return false
+  
+  try {
+    const result = await redis.ping()
+    return result === 'PONG'
+  } catch (err) {
+    logger.error('Redis: Ping failed', { error: String(err) })
+    return false
+  }
+}
+
+// Single consolidated state key
+export const REDIS_KEY = 'chess:state'

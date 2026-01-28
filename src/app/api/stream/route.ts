@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { getSnapshot, subscribeToSnapshot } from '@/lib/gameSnapshot'
 import { getClientIdentifier } from '@/lib/security'
 import { checkRateLimit } from '@/lib/ratelimit'
+import { logger } from '@/lib/logger'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -13,6 +14,7 @@ export async function GET(request: NextRequest) {
   const rateLimitResult = await checkRateLimit(clientId, 'general')
   
   if (!rateLimitResult.success) {
+    logger.warn('Stream rate limited', { clientId })
     return new Response(
       JSON.stringify({ error: 'Too many connections. Please wait.' }),
       {

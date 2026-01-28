@@ -1,5 +1,6 @@
-import { Chess, Square, Move } from 'chess.js'
-import { getRedis, isRedisAvailable, REDIS_KEYS } from './redis'
+import { Chess, Square } from 'chess.js'
+import { getRedis, isRedisAvailable, REDIS_KEY } from './redis'
+import { logger } from './logger'
 
 export interface Player {
   id: string
@@ -9,10 +10,10 @@ export interface Player {
 
 export interface TurnState {
   status: 'pending_confirmation' | 'confirmed'
-  deadline: number // Unix timestamp in ms
+  deadline: number
 }
 
-// Constants for timeouts
+// Constants for timeouts (in ms)
 export const CONFIRMATION_TIMEOUT_MS = 10000 // 10 seconds to confirm
 export const MOVE_TIMEOUT_MS = 30000 // 30 seconds to make a move
 
@@ -38,57 +39,171 @@ export interface QueueState {
   blackTurnState: TurnState | null
 }
 
-export interface PersistedGameState {
-  fen: string
-  lastMove: { from: Square; to: Square } | null
-  moveHistory: string[]
+// Consolidated Redis state - single key for everything
+export interface ConsolidatedState {
+  game: {
+    fen: string
+    lastMove: { from: Square; to: Square } | null
+    moveHistory: string[]
+  }
+  queues: {
+    white: Player[]
+    black: Player[]
+  }
+  current: {
+    white: Player | null
+    black: Player | null
+  }
+  turns: {
+    white: TurnState | null
+    black: TurnState | null
+  }
+  version: number
 }
 
-// In-memory fallback for local development without Redis
+function createDefaultState(): ConsolidatedState {
+  return {
+    game: {
+      fen: new Chess().fen(),
+      lastMove: null,
+      moveHistory: [],
+    },
+    queues: {
+      white: [],
+      black: [],
+    },
+    current: {
+      white: null,
+      black: null,
+    },
+    turns: {
+      white: null,
+      black: null,
+    },
+    version: 0,
+  }
+}
+
+function getTurnFromFen(fen: string): 'w' | 'b' {
+  const parts = fen.split(' ')
+  return (parts[1] || 'w') as 'w' | 'b'
+}
+
+function deriveGameState(state: ConsolidatedState): GameState {
+  const chess = new Chess()
+  try {
+    chess.load(state.game.fen)
+  } catch {
+    // Invalid FEN, use default
+  }
+
+  return {
+    fen: chess.fen(),
+    turn: chess.turn(),
+    isGameOver: chess.isGameOver(),
+    isCheckmate: chess.isCheckmate(),
+    isStalemate: chess.isStalemate(),
+    isDraw: chess.isDraw(),
+    isCheck: chess.isCheck(),
+    winner: chess.isCheckmate() ? (chess.turn() === 'w' ? 'b' : 'w') : null,
+    lastMove: state.game.lastMove,
+    moveHistory: state.game.moveHistory,
+  }
+}
+
+function deriveQueueState(state: ConsolidatedState): QueueState {
+  return {
+    whiteQueue: state.queues.white,
+    blackQueue: state.queues.black,
+    currentWhitePlayer: state.current.white,
+    currentBlackPlayer: state.current.black,
+    whiteTurnState: state.turns.white,
+    blackTurnState: state.turns.black,
+  }
+}
+
+// Assign next player from queue
+function assignNextPlayer(state: ConsolidatedState, color: 'w' | 'b'): void {
+  const queue = color === 'w' ? state.queues.white : state.queues.black
+
+  if (queue.length > 0) {
+    const nextPlayer = queue.shift()!
+    const turnState: TurnState = {
+      status: 'pending_confirmation',
+      deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
+    }
+    if (color === 'w') {
+      state.current.white = nextPlayer
+      state.turns.white = turnState
+    } else {
+      state.current.black = nextPlayer
+      state.turns.black = turnState
+    }
+  } else {
+    if (color === 'w') {
+      state.current.white = null
+      state.turns.white = null
+    } else {
+      state.current.black = null
+      state.turns.black = null
+    }
+  }
+}
+
+// Check and expire turns - called lazily on state access
+function checkAndExpireTurnsInline(state: ConsolidatedState): boolean {
+  const now = Date.now()
+  const turn = getTurnFromFen(state.game.fen)
+  let changed = false
+
+  // Only check the current turn's player
+  if (turn === 'w' && state.current.white && state.turns.white) {
+    if (now > state.turns.white.deadline) {
+      logger.info('Turn expired', { player: state.current.white.name, color: 'white' })
+      state.current.white = null
+      state.turns.white = null
+      assignNextPlayer(state, 'w')
+      changed = true
+    }
+  } else if (turn === 'b' && state.current.black && state.turns.black) {
+    if (now > state.turns.black.deadline) {
+      logger.info('Turn expired', { player: state.current.black.name, color: 'black' })
+      state.current.black = null
+      state.turns.black = null
+      assignNextPlayer(state, 'b')
+      changed = true
+    }
+  }
+
+  return changed
+}
+
+// In-memory fallback for local development
 class InMemoryStore {
-  private chess: Chess = new Chess()
-  private whiteQueue: Player[] = []
-  private blackQueue: Player[] = []
-  private currentWhitePlayer: Player | null = null
-  private currentBlackPlayer: Player | null = null
-  private whiteTurnState: TurnState | null = null
-  private blackTurnState: TurnState | null = null
-  private lastMove: { from: Square; to: Square } | null = null
-  private version: number = 0
+  private state: ConsolidatedState = createDefaultState()
+
+  getState(): ConsolidatedState {
+    // Lazy expiration check
+    checkAndExpireTurnsInline(this.state)
+    return this.state
+  }
 
   getGameState(): GameState {
-    return {
-      fen: this.chess.fen(),
-      turn: this.chess.turn(),
-      isGameOver: this.chess.isGameOver(),
-      isCheckmate: this.chess.isCheckmate(),
-      isStalemate: this.chess.isStalemate(),
-      isDraw: this.chess.isDraw(),
-      isCheck: this.chess.isCheck(),
-      winner: this.chess.isCheckmate() ? (this.chess.turn() === 'w' ? 'b' : 'w') : null,
-      lastMove: this.lastMove,
-      moveHistory: this.chess.history(),
-    }
+    return deriveGameState(this.getState())
   }
 
   getQueueState(): QueueState {
-    return {
-      whiteQueue: [...this.whiteQueue],
-      blackQueue: [...this.blackQueue],
-      currentWhitePlayer: this.currentWhitePlayer,
-      currentBlackPlayer: this.currentBlackPlayer,
-      whiteTurnState: this.whiteTurnState,
-      blackTurnState: this.blackTurnState,
-    }
+    return deriveQueueState(this.getState())
   }
 
   getVersion(): number {
-    return this.version
+    return this.state.version
   }
 
   joinQueue(player: Player, color: 'w' | 'b'): boolean {
-    const queue = color === 'w' ? this.whiteQueue : this.blackQueue
-    const currentPlayer = color === 'w' ? this.currentWhitePlayer : this.currentBlackPlayer
+    const state = this.getState()
+    const queue = color === 'w' ? state.queues.white : state.queues.black
+    const currentPlayer = color === 'w' ? state.current.white : state.current.black
 
     if (queue.some(p => p.id === player.id)) return false
     if (currentPlayer?.id === player.id) return false
@@ -96,57 +211,38 @@ class InMemoryStore {
     queue.push(player)
 
     if (!currentPlayer) {
-      this.assignNextPlayer(color)
+      assignNextPlayer(state, color)
     }
 
-    this.version++
+    state.version++
     return true
   }
 
   leaveQueue(playerId: string): void {
-    this.whiteQueue = this.whiteQueue.filter(p => p.id !== playerId)
-    this.blackQueue = this.blackQueue.filter(p => p.id !== playerId)
+    const state = this.getState()
 
-    if (this.currentWhitePlayer?.id === playerId) {
-      this.currentWhitePlayer = null
-      this.assignNextPlayer('w')
+    state.queues.white = state.queues.white.filter(p => p.id !== playerId)
+    state.queues.black = state.queues.black.filter(p => p.id !== playerId)
+
+    if (state.current.white?.id === playerId) {
+      state.current.white = null
+      state.turns.white = null
+      assignNextPlayer(state, 'w')
     }
-    if (this.currentBlackPlayer?.id === playerId) {
-      this.currentBlackPlayer = null
-      this.assignNextPlayer('b')
+    if (state.current.black?.id === playerId) {
+      state.current.black = null
+      state.turns.black = null
+      assignNextPlayer(state, 'b')
     }
 
-    this.version++
-  }
-
-  private assignNextPlayer(color: 'w' | 'b'): void {
-    const queue = color === 'w' ? this.whiteQueue : this.blackQueue
-    if (queue.length > 0) {
-      const nextPlayer = queue.shift()!
-      const turnState: TurnState = {
-        status: 'pending_confirmation',
-        deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
-      }
-      if (color === 'w') {
-        this.currentWhitePlayer = nextPlayer
-        this.whiteTurnState = turnState
-      } else {
-        this.currentBlackPlayer = nextPlayer
-        this.blackTurnState = turnState
-      }
-    } else {
-      if (color === 'w') {
-        this.whiteTurnState = null
-      } else {
-        this.blackTurnState = null
-      }
-    }
+    state.version++
   }
 
   confirmReady(playerId: string): { success: boolean; error?: string } {
-    const turn = this.chess.turn()
-    const currentPlayer = turn === 'w' ? this.currentWhitePlayer : this.currentBlackPlayer
-    const turnState = turn === 'w' ? this.whiteTurnState : this.blackTurnState
+    const state = this.getState()
+    const turn = getTurnFromFen(state.game.fen)
+    const currentPlayer = turn === 'w' ? state.current.white : state.current.black
+    const turnState = turn === 'w' ? state.turns.white : state.turns.black
 
     if (currentPlayer?.id !== playerId) {
       return { success: false, error: 'Not your turn' }
@@ -166,83 +262,63 @@ class InMemoryStore {
     }
 
     if (turn === 'w') {
-      this.whiteTurnState = newTurnState
+      state.turns.white = newTurnState
     } else {
-      this.blackTurnState = newTurnState
+      state.turns.black = newTurnState
     }
 
-    this.version++
+    state.version++
     return { success: true }
   }
 
-  checkAndExpireTurns(): boolean {
-    const now = Date.now()
-    let changed = false
-    const turn = this.chess.turn()
-
-    // Only check the current turn's player
-    if (turn === 'w' && this.currentWhitePlayer && this.whiteTurnState) {
-      if (now > this.whiteTurnState.deadline) {
-        // Player timed out - remove them and assign next
-        this.currentWhitePlayer = null
-        this.whiteTurnState = null
-        this.assignNextPlayer('w')
-        changed = true
-      }
-    } else if (turn === 'b' && this.currentBlackPlayer && this.blackTurnState) {
-      if (now > this.blackTurnState.deadline) {
-        // Player timed out - remove them and assign next
-        this.currentBlackPlayer = null
-        this.blackTurnState = null
-        this.assignNextPlayer('b')
-        changed = true
-      }
-    }
-
-    if (changed) {
-      this.version++
-    }
-    return changed
-  }
-
   makeMove(playerId: string, from: Square, to: Square, promotion?: string): { success: boolean; error?: string } {
-    const currentTurn = this.chess.turn()
-    const currentPlayer = currentTurn === 'w' ? this.currentWhitePlayer : this.currentBlackPlayer
-    const turnState = currentTurn === 'w' ? this.whiteTurnState : this.blackTurnState
+    const state = this.getState()
+    const chess = new Chess()
+    try {
+      chess.load(state.game.fen)
+    } catch {
+      return { success: false, error: 'Invalid game state' }
+    }
+
+    const currentTurn = chess.turn()
+    const currentPlayer = currentTurn === 'w' ? state.current.white : state.current.black
+    const turnState = currentTurn === 'w' ? state.turns.white : state.turns.black
 
     if (currentPlayer?.id !== playerId) {
       return { success: false, error: 'Not your turn' }
     }
 
-    // Must be confirmed to make a move
     if (!turnState || turnState.status !== 'confirmed') {
       return { success: false, error: 'Please confirm you are ready first' }
     }
 
-    // Check if move timer expired
     if (Date.now() > turnState.deadline) {
       return { success: false, error: 'Move timeout - you took too long' }
     }
 
     try {
-      const move = this.chess.move({ from, to, promotion })
+      const move = chess.move({ from, to, promotion })
       if (move) {
-        this.lastMove = { from, to }
-        
-        const queue = currentTurn === 'w' ? this.whiteQueue : this.blackQueue
+        state.game.fen = chess.fen()
+        state.game.lastMove = { from, to }
+        state.game.moveHistory = chess.history()
+
+        // Return player to queue
+        const queue = currentTurn === 'w' ? state.queues.white : state.queues.black
         queue.push(currentPlayer)
-        
+
+        // Clear current and assign next
         if (currentTurn === 'w') {
-          this.currentWhitePlayer = null
-          this.whiteTurnState = null
-          this.assignNextPlayer('w')
+          state.current.white = null
+          state.turns.white = null
+          assignNextPlayer(state, 'w')
         } else {
-          this.currentBlackPlayer = null
-          this.blackTurnState = null
-          this.assignNextPlayer('b')
+          state.current.black = null
+          state.turns.black = null
+          assignNextPlayer(state, 'b')
         }
 
-        this.version++
+        state.version++
         return { success: true }
       }
       return { success: false, error: 'Invalid move' }
@@ -251,588 +327,340 @@ class InMemoryStore {
     }
   }
 
-  getValidMoves(square: Square): Move[] {
-    return this.chess.moves({ square, verbose: true })
-  }
-
   resetGame(): void {
-    this.chess.reset()
-    this.lastMove = null
-    this.version++
+    const state = this.state
+    state.game = {
+      fen: new Chess().fen(),
+      lastMove: null,
+      moveHistory: [],
+    }
+    state.version++
   }
 
   clearAllQueues(): void {
-    this.whiteQueue = []
-    this.blackQueue = []
-    this.currentWhitePlayer = null
-    this.currentBlackPlayer = null
-    this.whiteTurnState = null
-    this.blackTurnState = null
-    this.chess.reset()
-    this.lastMove = null
-    this.version++
+    this.state = createDefaultState()
   }
 
   kickPlayerByName(playerName: string): boolean {
+    const state = this.getState()
     let found = false
-    
-    const whiteLen = this.whiteQueue.length
-    this.whiteQueue = this.whiteQueue.filter(p => p.name !== playerName)
-    if (this.whiteQueue.length !== whiteLen) found = true
-    
-    const blackLen = this.blackQueue.length
-    this.blackQueue = this.blackQueue.filter(p => p.name !== playerName)
-    if (this.blackQueue.length !== blackLen) found = true
-    
-    if (this.currentWhitePlayer?.name === playerName) {
-      this.currentWhitePlayer = null
-      this.assignNextPlayer('w')
+
+    const whiteLen = state.queues.white.length
+    state.queues.white = state.queues.white.filter(p => p.name !== playerName)
+    if (state.queues.white.length !== whiteLen) found = true
+
+    const blackLen = state.queues.black.length
+    state.queues.black = state.queues.black.filter(p => p.name !== playerName)
+    if (state.queues.black.length !== blackLen) found = true
+
+    if (state.current.white?.name === playerName) {
+      state.current.white = null
+      state.turns.white = null
+      assignNextPlayer(state, 'w')
       found = true
     }
-    
-    if (this.currentBlackPlayer?.name === playerName) {
-      this.currentBlackPlayer = null
-      this.assignNextPlayer('b')
+
+    if (state.current.black?.name === playerName) {
+      state.current.black = null
+      state.turns.black = null
+      assignNextPlayer(state, 'b')
       found = true
     }
-    
-    if (found) this.version++
+
+    if (found) state.version++
     return found
   }
 }
 
-// Redis-backed store for production with batched operations
+// Redis-backed store with optimistic locking
 class RedisStore {
-  async getVersion(): Promise<number> {
+  // Get state with lazy expiration check - single Redis read
+  private async getStateWithExpiration(): Promise<ConsolidatedState> {
     const redis = getRedis()
-    if (!redis) return 0
-    const version = await redis.get<number>(REDIS_KEYS.VERSION)
-    return version || 0
+    if (!redis) return createDefaultState()
+
+    try {
+      const state = await redis.get<ConsolidatedState>(REDIS_KEY)
+      if (!state) return createDefaultState()
+
+      // Lazy expiration check
+      const changed = checkAndExpireTurnsInline(state)
+      if (changed) {
+        state.version++
+        // Write back expired state - await to prevent race conditions
+        try {
+          await redis.set(REDIS_KEY, state)
+        } catch (err) {
+          logger.error('Failed to write expired state', { error: String(err) })
+        }
+      }
+
+      return state
+    } catch (err) {
+      logger.error('Redis: Failed to get state', { error: String(err) })
+      return createDefaultState()
+    }
+  }
+
+  // Optimistic locking update - retry on version conflict only
+  private async updateState(
+    modifier: (state: ConsolidatedState) => { success: boolean; error?: string }
+  ): Promise<{ success: boolean; state: ConsolidatedState; error?: string }> {
+    const redis = getRedis()
+    if (!redis) {
+      return { success: false, state: createDefaultState(), error: 'Redis not available' }
+    }
+
+    const maxRetries = 3
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        // Single GET
+        let state = await redis.get<ConsolidatedState>(REDIS_KEY)
+        if (!state) state = createDefaultState()
+
+        // Check expiration first
+        checkAndExpireTurnsInline(state)
+
+        const originalVersion = state.version
+
+        // Apply modification - returns success/error for business logic
+        const result = modifier(state)
+        if (!result.success) {
+          // Business logic failure - don't retry
+          return { success: false, state, error: result.error }
+        }
+
+        state.version++
+
+        // Simple optimistic lock: read version, check, write
+        // Re-read to check version hasn't changed
+        const currentState = await redis.get<ConsolidatedState>(REDIS_KEY)
+        const currentVersion = currentState?.version ?? 0
+
+        if (currentVersion !== originalVersion) {
+          // Version mismatch, retry
+          logger.debug('Optimistic lock conflict, retrying', { attempt: attempt + 1 })
+          continue
+        }
+
+        // Version matches, safe to write
+        await redis.set(REDIS_KEY, state)
+        return { success: true, state }
+      } catch (err) {
+        logger.error('Redis: Update failed', { error: String(err), attempt })
+        if (attempt === maxRetries - 1) {
+          return { success: false, state: createDefaultState(), error: 'Database error' }
+        }
+      }
+    }
+
+    return { success: false, state: createDefaultState(), error: 'Concurrent modification - please retry' }
+  }
+
+  async getVersion(): Promise<number> {
+    const state = await this.getStateWithExpiration()
+    return state.version
   }
 
   async getGameState(): Promise<GameState> {
-    const redis = getRedis()
-    if (!redis) {
-      const chess = new Chess()
-      return {
-        fen: chess.fen(),
-        turn: chess.turn(),
-        isGameOver: false,
-        isCheckmate: false,
-        isStalemate: false,
-        isDraw: false,
-        isCheck: false,
-        winner: null,
-        lastMove: null,
-        moveHistory: [],
-      }
-    }
-
-    const persisted = await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
-    const chess = new Chess()
-    
-    if (persisted?.fen) {
-      chess.load(persisted.fen)
-    }
-
-    return {
-      fen: chess.fen(),
-      turn: chess.turn(),
-      isGameOver: chess.isGameOver(),
-      isCheckmate: chess.isCheckmate(),
-      isStalemate: chess.isStalemate(),
-      isDraw: chess.isDraw(),
-      isCheck: chess.isCheck(),
-      winner: chess.isCheckmate() ? (chess.turn() === 'w' ? 'b' : 'w') : null,
-      lastMove: persisted?.lastMove || null,
-      moveHistory: persisted?.moveHistory || [],
-    }
+    const state = await this.getStateWithExpiration()
+    return deriveGameState(state)
   }
 
   async getQueueState(): Promise<QueueState> {
-    const redis = getRedis()
-    if (!redis) {
-      return {
-        whiteQueue: [],
-        blackQueue: [],
-        currentWhitePlayer: null,
-        currentBlackPlayer: null,
-        whiteTurnState: null,
-        blackTurnState: null,
-      }
-    }
-
-    const [whiteQueue, blackQueue, currentWhitePlayer, currentBlackPlayer, whiteTurnState, blackTurnState] = await Promise.all([
-      redis.get<Player[]>(REDIS_KEYS.WHITE_QUEUE),
-      redis.get<Player[]>(REDIS_KEYS.BLACK_QUEUE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
-      redis.get<TurnState>(REDIS_KEYS.TURN_WHITE),
-      redis.get<TurnState>(REDIS_KEYS.TURN_BLACK),
-    ])
-
-    return {
-      whiteQueue: whiteQueue || [],
-      blackQueue: blackQueue || [],
-      currentWhitePlayer: currentWhitePlayer || null,
-      currentBlackPlayer: currentBlackPlayer || null,
-      whiteTurnState: whiteTurnState || null,
-      blackTurnState: blackTurnState || null,
-    }
+    const state = await this.getStateWithExpiration()
+    return deriveQueueState(state)
   }
 
   async joinQueue(player: Player, color: 'w' | 'b'): Promise<boolean> {
-    const redis = getRedis()
-    if (!redis) {
-      throw new Error('Redis not available - cannot join queue')
-    }
+    const result = await this.updateState((state) => {
+      const queue = color === 'w' ? state.queues.white : state.queues.black
+      const currentPlayer = color === 'w' ? state.current.white : state.current.black
 
-    // Batch fetch relevant data
-    const queueKey = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
-    const currentKey = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
-
-    const [queueData, currentPlayer] = await Promise.all([
-      redis.get<Player[]>(queueKey),
-      redis.get<Player>(currentKey),
-    ])
-
-    const queue = queueData || []
-
-    // Check if already in queue or is current player
-    if (queue.some(p => p.id === player.id)) return false
-    if (currentPlayer?.id === player.id) return false
-
-    // Add to queue
-    queue.push(player)
-
-    // Batch write operations
-    const ops: Promise<unknown>[] = []
-    const turnKey = color === 'w' ? REDIS_KEYS.TURN_WHITE : REDIS_KEYS.TURN_BLACK
-
-    // If no current player, assign from queue
-    if (!currentPlayer && queue.length > 0) {
-      const nextPlayer = queue.shift()!
-      const turnState: TurnState = {
-        status: 'pending_confirmation',
-        deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
+      // Check if already in queue or is current player
+      if (queue.some(p => p.id === player.id)) {
+        return { success: false, error: 'Already in queue' }
       }
-      ops.push(
-        redis.set(queueKey, queue),
-        redis.set(currentKey, nextPlayer),
-        redis.set(turnKey, turnState)
-      )
-    } else {
-      ops.push(redis.set(queueKey, queue))
-    }
-
-    ops.push(redis.incr(REDIS_KEYS.VERSION))
-    await Promise.all(ops)
-
-    return true
-  }
-
-  async confirmReady(playerId: string): Promise<{ success: boolean; error?: string }> {
-    const redis = getRedis()
-    if (!redis) {
-      return { success: false, error: 'Redis not available' }
-    }
-
-    // Get current game state to determine whose turn it is
-    const [persisted, currentWhite, currentBlack, whiteTurnState, blackTurnState] = await Promise.all([
-      redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
-      redis.get<TurnState>(REDIS_KEYS.TURN_WHITE),
-      redis.get<TurnState>(REDIS_KEYS.TURN_BLACK),
-    ])
-
-    const chess = new Chess()
-    if (persisted?.fen) {
-      chess.load(persisted.fen)
-    }
-
-    const turn = chess.turn()
-    const currentPlayer = turn === 'w' ? currentWhite : currentBlack
-    const turnState = turn === 'w' ? whiteTurnState : blackTurnState
-    const turnKey = turn === 'w' ? REDIS_KEYS.TURN_WHITE : REDIS_KEYS.TURN_BLACK
-
-    if (currentPlayer?.id !== playerId) {
-      return { success: false, error: 'Not your turn' }
-    }
-
-    if (!turnState || turnState.status !== 'pending_confirmation') {
-      return { success: false, error: 'No confirmation needed' }
-    }
-
-    if (Date.now() > turnState.deadline) {
-      return { success: false, error: 'Confirmation timeout' }
-    }
-
-    const newTurnState: TurnState = {
-      status: 'confirmed',
-      deadline: Date.now() + MOVE_TIMEOUT_MS,
-    }
-
-    await Promise.all([
-      redis.set(turnKey, newTurnState),
-      redis.incr(REDIS_KEYS.VERSION),
-    ])
-
-    return { success: true }
-  }
-
-  async checkAndExpireTurns(): Promise<boolean> {
-    const redis = getRedis()
-    if (!redis) return false
-
-    const now = Date.now()
-
-    // Get current game state and turn states
-    const [persisted, currentWhite, currentBlack, whiteTurnState, blackTurnState, whiteQueue, blackQueue] = await Promise.all([
-      redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
-      redis.get<TurnState>(REDIS_KEYS.TURN_WHITE),
-      redis.get<TurnState>(REDIS_KEYS.TURN_BLACK),
-      redis.get<Player[]>(REDIS_KEYS.WHITE_QUEUE),
-      redis.get<Player[]>(REDIS_KEYS.BLACK_QUEUE),
-    ])
-
-    const chess = new Chess()
-    if (persisted?.fen) {
-      chess.load(persisted.fen)
-    }
-
-    const turn = chess.turn()
-    let changed = false
-
-    // Only check the current turn's player
-    if (turn === 'w' && currentWhite && whiteTurnState && now > whiteTurnState.deadline) {
-      // White player timed out
-      const queue = whiteQueue || []
-      const ops: Promise<unknown>[] = [redis.del(REDIS_KEYS.CURRENT_WHITE)]
-
-      if (queue.length > 0) {
-        const nextPlayer = queue.shift()!
-        const newTurnState: TurnState = {
-          status: 'pending_confirmation',
-          deadline: now + CONFIRMATION_TIMEOUT_MS,
-        }
-        ops.push(
-          redis.set(REDIS_KEYS.WHITE_QUEUE, queue),
-          redis.set(REDIS_KEYS.CURRENT_WHITE, nextPlayer),
-          redis.set(REDIS_KEYS.TURN_WHITE, newTurnState)
-        )
-      } else {
-        ops.push(redis.del(REDIS_KEYS.TURN_WHITE))
+      if (currentPlayer?.id === player.id) {
+        return { success: false, error: 'Already playing' }
       }
 
-      ops.push(redis.incr(REDIS_KEYS.VERSION))
-      await Promise.all(ops)
-      changed = true
-    } else if (turn === 'b' && currentBlack && blackTurnState && now > blackTurnState.deadline) {
-      // Black player timed out
-      const queue = blackQueue || []
-      const ops: Promise<unknown>[] = [redis.del(REDIS_KEYS.CURRENT_BLACK)]
+      queue.push(player)
 
-      if (queue.length > 0) {
-        const nextPlayer = queue.shift()!
-        const newTurnState: TurnState = {
-          status: 'pending_confirmation',
-          deadline: now + CONFIRMATION_TIMEOUT_MS,
-        }
-        ops.push(
-          redis.set(REDIS_KEYS.BLACK_QUEUE, queue),
-          redis.set(REDIS_KEYS.CURRENT_BLACK, nextPlayer),
-          redis.set(REDIS_KEYS.TURN_BLACK, newTurnState)
-        )
-      } else {
-        ops.push(redis.del(REDIS_KEYS.TURN_BLACK))
+      if (!currentPlayer) {
+        assignNextPlayer(state, color)
       }
 
-      ops.push(redis.incr(REDIS_KEYS.VERSION))
-      await Promise.all(ops)
-      changed = true
-    }
+      return { success: true }
+    })
 
-    return changed
+    return result.success
   }
 
   async leaveQueue(playerId: string): Promise<void> {
-    const redis = getRedis()
-    if (!redis) return
+    await this.updateState((state) => {
+      state.queues.white = state.queues.white.filter(p => p.id !== playerId)
+      state.queues.black = state.queues.black.filter(p => p.id !== playerId)
 
-    // Batch fetch all relevant data
-    const [whiteQueue, blackQueue, currentWhite, currentBlack] = await Promise.all([
-      redis.get<Player[]>(REDIS_KEYS.WHITE_QUEUE),
-      redis.get<Player[]>(REDIS_KEYS.BLACK_QUEUE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
-    ])
-
-    const filteredWhite = (whiteQueue || []).filter(p => p.id !== playerId)
-    const filteredBlack = (blackQueue || []).filter(p => p.id !== playerId)
-
-    const ops: Promise<unknown>[] = [
-      redis.set(REDIS_KEYS.WHITE_QUEUE, filteredWhite),
-      redis.set(REDIS_KEYS.BLACK_QUEUE, filteredBlack),
-    ]
-
-    // Handle current player removal and assignment
-    if (currentWhite?.id === playerId) {
-      if (filteredWhite.length > 0) {
-        const next = filteredWhite.shift()!
-        const turnState: TurnState = {
-          status: 'pending_confirmation',
-          deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
-        }
-        ops.push(
-          redis.set(REDIS_KEYS.CURRENT_WHITE, next),
-          redis.set(REDIS_KEYS.WHITE_QUEUE, filteredWhite),
-          redis.set(REDIS_KEYS.TURN_WHITE, turnState)
-        )
-      } else {
-        ops.push(
-          redis.del(REDIS_KEYS.CURRENT_WHITE),
-          redis.del(REDIS_KEYS.TURN_WHITE)
-        )
+      if (state.current.white?.id === playerId) {
+        state.current.white = null
+        state.turns.white = null
+        assignNextPlayer(state, 'w')
       }
-    }
-
-    if (currentBlack?.id === playerId) {
-      if (filteredBlack.length > 0) {
-        const next = filteredBlack.shift()!
-        const turnState: TurnState = {
-          status: 'pending_confirmation',
-          deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
-        }
-        ops.push(
-          redis.set(REDIS_KEYS.CURRENT_BLACK, next),
-          redis.set(REDIS_KEYS.BLACK_QUEUE, filteredBlack),
-          redis.set(REDIS_KEYS.TURN_BLACK, turnState)
-        )
-      } else {
-        ops.push(
-          redis.del(REDIS_KEYS.CURRENT_BLACK),
-          redis.del(REDIS_KEYS.TURN_BLACK)
-        )
+      if (state.current.black?.id === playerId) {
+        state.current.black = null
+        state.turns.black = null
+        assignNextPlayer(state, 'b')
       }
-    }
 
-    ops.push(redis.incr(REDIS_KEYS.VERSION))
-    await Promise.all(ops)
+      return { success: true }
+    })
+  }
+
+  async confirmReady(playerId: string): Promise<{ success: boolean; error?: string }> {
+    const result = await this.updateState((state) => {
+      const turn = getTurnFromFen(state.game.fen)
+      const currentPlayer = turn === 'w' ? state.current.white : state.current.black
+      const turnState = turn === 'w' ? state.turns.white : state.turns.black
+
+      if (currentPlayer?.id !== playerId) {
+        return { success: false, error: 'Not your turn' }
+      }
+
+      if (!turnState || turnState.status !== 'pending_confirmation') {
+        return { success: false, error: 'No confirmation needed' }
+      }
+
+      if (Date.now() > turnState.deadline) {
+        return { success: false, error: 'Confirmation timeout' }
+      }
+
+      const newTurnState: TurnState = {
+        status: 'confirmed',
+        deadline: Date.now() + MOVE_TIMEOUT_MS,
+      }
+
+      if (turn === 'w') {
+        state.turns.white = newTurnState
+      } else {
+        state.turns.black = newTurnState
+      }
+
+      return { success: true }
+    })
+
+    return { success: result.success, error: result.error }
   }
 
   async makeMove(playerId: string, from: Square, to: Square, promotion?: string): Promise<{ success: boolean; error?: string }> {
-    const redis = getRedis()
-    if (!redis) {
-      return { success: false, error: 'Redis not available' }
-    }
+    const result = await this.updateState((state) => {
+      const chess = new Chess()
+      try {
+        chess.load(state.game.fen)
+      } catch {
+        return { success: false, error: 'Invalid game state' }
+      }
 
-    // Batch fetch game state and current player
-    const [persisted, currentWhite, currentBlack, whiteQueue, blackQueue, whiteTurnState, blackTurnState] = await Promise.all([
-      redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
-      redis.get<Player[]>(REDIS_KEYS.WHITE_QUEUE),
-      redis.get<Player[]>(REDIS_KEYS.BLACK_QUEUE),
-      redis.get<TurnState>(REDIS_KEYS.TURN_WHITE),
-      redis.get<TurnState>(REDIS_KEYS.TURN_BLACK),
-    ])
+      const currentTurn = chess.turn()
+      const currentPlayer = currentTurn === 'w' ? state.current.white : state.current.black
+      const turnState = currentTurn === 'w' ? state.turns.white : state.turns.black
 
-    const chess = new Chess()
-    if (persisted?.fen) {
-      chess.load(persisted.fen)
-    }
+      if (currentPlayer?.id !== playerId) {
+        return { success: false, error: 'Not your turn' }
+      }
 
-    const currentTurn = chess.turn()
-    const currentPlayer = currentTurn === 'w' ? currentWhite : currentBlack
-    const turnState = currentTurn === 'w' ? whiteTurnState : blackTurnState
+      if (!turnState || turnState.status !== 'confirmed') {
+        return { success: false, error: 'Please confirm you are ready first' }
+      }
 
-    if (currentPlayer?.id !== playerId) {
-      return { success: false, error: 'Not your turn' }
-    }
+      if (Date.now() > turnState.deadline) {
+        return { success: false, error: 'Move timeout - you took too long' }
+      }
 
-    // Must be confirmed to make a move
-    if (!turnState || turnState.status !== 'confirmed') {
-      return { success: false, error: 'Please confirm you are ready first' }
-    }
+      try {
+        const move = chess.move({ from, to, promotion })
+        if (!move) {
+          return { success: false, error: 'Invalid move' }
+        }
 
-    // Check if move timer expired
-    if (Date.now() > turnState.deadline) {
-      return { success: false, error: 'Move timeout - you took too long' }
-    }
+        state.game.fen = chess.fen()
+        state.game.lastMove = { from, to }
+        state.game.moveHistory = chess.history()
 
-    try {
-      const move = chess.move({ from, to, promotion })
-      if (!move) {
+        // Return player to queue
+        const queue = currentTurn === 'w' ? state.queues.white : state.queues.black
+        queue.push(currentPlayer)
+
+        // Clear current and assign next
+        if (currentTurn === 'w') {
+          state.current.white = null
+          state.turns.white = null
+          assignNextPlayer(state, 'w')
+        } else {
+          state.current.black = null
+          state.turns.black = null
+          assignNextPlayer(state, 'b')
+        }
+
+        return { success: true }
+      } catch {
         return { success: false, error: 'Invalid move' }
       }
+    })
 
-      // Prepare batch write operations
-      const queue = currentTurn === 'w' ? (whiteQueue || []) : (blackQueue || [])
-      queue.push(currentPlayer)
-
-      // Assign next player
-      let nextPlayer: Player | null = null
-      let newTurnState: TurnState | null = null
-      if (queue.length > 0) {
-        nextPlayer = queue.shift()!
-        newTurnState = {
-          status: 'pending_confirmation',
-          deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
-        }
-      }
-
-      const queueKey = currentTurn === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
-      const currentKey = currentTurn === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
-      const turnKey = currentTurn === 'w' ? REDIS_KEYS.TURN_WHITE : REDIS_KEYS.TURN_BLACK
-
-      const ops: Promise<unknown>[] = [
-        redis.set(REDIS_KEYS.GAME_STATE, {
-          fen: chess.fen(),
-          lastMove: { from, to },
-          moveHistory: chess.history(),
-        }),
-        redis.set(queueKey, queue),
-        nextPlayer ? redis.set(currentKey, nextPlayer) : redis.del(currentKey),
-        newTurnState ? redis.set(turnKey, newTurnState) : redis.del(turnKey),
-        redis.incr(REDIS_KEYS.VERSION),
-      ]
-
-      await Promise.all(ops)
-      return { success: true }
-    } catch {
-      return { success: false, error: 'Invalid move' }
-    }
-  }
-
-  async getValidMoves(square: Square): Promise<Move[]> {
-    const redis = getRedis()
-    if (!redis) {
-      return new Chess().moves({ square, verbose: true })
-    }
-
-    const persisted = await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
-    const chess = new Chess()
-    
-    if (persisted?.fen) {
-      chess.load(persisted.fen)
-    }
-
-    return chess.moves({ square, verbose: true })
+    return { success: result.success, error: result.error }
   }
 
   async resetGame(): Promise<void> {
-    const redis = getRedis()
-    if (!redis) return
-
-    await Promise.all([
-      redis.set(REDIS_KEYS.GAME_STATE, {
+    await this.updateState((state) => {
+      state.game = {
         fen: new Chess().fen(),
         lastMove: null,
         moveHistory: [],
-      }),
-      redis.incr(REDIS_KEYS.VERSION),
-    ])
+      }
+      return { success: true }
+    })
   }
 
   async clearAllQueues(): Promise<void> {
     const redis = getRedis()
     if (!redis) return
 
-    await Promise.all([
-      redis.set(REDIS_KEYS.WHITE_QUEUE, []),
-      redis.set(REDIS_KEYS.BLACK_QUEUE, []),
-      redis.del(REDIS_KEYS.CURRENT_WHITE),
-      redis.del(REDIS_KEYS.CURRENT_BLACK),
-      redis.del(REDIS_KEYS.TURN_WHITE),
-      redis.del(REDIS_KEYS.TURN_BLACK),
-      redis.set(REDIS_KEYS.GAME_STATE, {
-        fen: new Chess().fen(),
-        lastMove: null,
-        moveHistory: [],
-      }),
-      redis.incr(REDIS_KEYS.VERSION),
-    ])
+    try {
+      await redis.set(REDIS_KEY, createDefaultState())
+    } catch (err) {
+      logger.error('Redis: Failed to clear all', { error: String(err) })
+    }
   }
 
   async kickPlayerByName(playerName: string): Promise<boolean> {
-    const redis = getRedis()
-    if (!redis) return false
-
-    // Batch fetch all data
-    const [whiteQueue, blackQueue, currentWhite, currentBlack] = await Promise.all([
-      redis.get<Player[]>(REDIS_KEYS.WHITE_QUEUE),
-      redis.get<Player[]>(REDIS_KEYS.BLACK_QUEUE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_WHITE),
-      redis.get<Player>(REDIS_KEYS.CURRENT_BLACK),
-    ])
-
     let found = false
-    const ops: Promise<unknown>[] = []
 
-    // Filter queues
-    const whiteFiltered = (whiteQueue || []).filter(p => p.name !== playerName)
-    const blackFiltered = (blackQueue || []).filter(p => p.name !== playerName)
+    await this.updateState((state) => {
+      const whiteLen = state.queues.white.length
+      state.queues.white = state.queues.white.filter(p => p.name !== playerName)
+      if (state.queues.white.length !== whiteLen) found = true
 
-    if (whiteFiltered.length !== (whiteQueue || []).length) {
-      found = true
-      ops.push(redis.set(REDIS_KEYS.WHITE_QUEUE, whiteFiltered))
-    }
+      const blackLen = state.queues.black.length
+      state.queues.black = state.queues.black.filter(p => p.name !== playerName)
+      if (state.queues.black.length !== blackLen) found = true
 
-    if (blackFiltered.length !== (blackQueue || []).length) {
-      found = true
-      ops.push(redis.set(REDIS_KEYS.BLACK_QUEUE, blackFiltered))
-    }
-
-    // Check current players
-    if (currentWhite?.name === playerName) {
-      found = true
-      if (whiteFiltered.length > 0) {
-        const next = whiteFiltered.shift()!
-        const turnState: TurnState = {
-          status: 'pending_confirmation',
-          deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
-        }
-        ops.push(
-          redis.set(REDIS_KEYS.CURRENT_WHITE, next),
-          redis.set(REDIS_KEYS.WHITE_QUEUE, whiteFiltered),
-          redis.set(REDIS_KEYS.TURN_WHITE, turnState)
-        )
-      } else {
-        ops.push(
-          redis.del(REDIS_KEYS.CURRENT_WHITE),
-          redis.del(REDIS_KEYS.TURN_WHITE)
-        )
+      if (state.current.white?.name === playerName) {
+        state.current.white = null
+        state.turns.white = null
+        assignNextPlayer(state, 'w')
+        found = true
       }
-    }
 
-    if (currentBlack?.name === playerName) {
-      found = true
-      if (blackFiltered.length > 0) {
-        const next = blackFiltered.shift()!
-        const turnState: TurnState = {
-          status: 'pending_confirmation',
-          deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
-        }
-        ops.push(
-          redis.set(REDIS_KEYS.CURRENT_BLACK, next),
-          redis.set(REDIS_KEYS.BLACK_QUEUE, blackFiltered),
-          redis.set(REDIS_KEYS.TURN_BLACK, turnState)
-        )
-      } else {
-        ops.push(
-          redis.del(REDIS_KEYS.CURRENT_BLACK),
-          redis.del(REDIS_KEYS.TURN_BLACK)
-        )
+      if (state.current.black?.name === playerName) {
+        state.current.black = null
+        state.turns.black = null
+        assignNextPlayer(state, 'b')
+        found = true
       }
-    }
 
-    if (found) {
-      ops.push(redis.incr(REDIS_KEYS.VERSION))
-      await Promise.all(ops)
-    }
+      return { success: true }
+    })
 
     return found
   }
@@ -885,13 +713,6 @@ export const gameStore = {
     return inMemoryStore.makeMove(playerId, from, to, promotion)
   },
 
-  async getValidMoves(square: Square): Promise<Move[]> {
-    if (isRedisAvailable()) {
-      return await redisStore.getValidMoves(square)
-    }
-    return inMemoryStore.getValidMoves(square)
-  },
-
   async resetGame(): Promise<void> {
     if (isRedisAvailable()) {
       return await redisStore.resetGame()
@@ -918,12 +739,5 @@ export const gameStore = {
       return await redisStore.confirmReady(playerId)
     }
     return inMemoryStore.confirmReady(playerId)
-  },
-
-  async checkAndExpireTurns(): Promise<boolean> {
-    if (isRedisAvailable()) {
-      return await redisStore.checkAndExpireTurns()
-    }
-    return inMemoryStore.checkAndExpireTurns()
   },
 }

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { checkRateLimit, getRateLimitHeaders, RateLimitType } from './ratelimit'
+import { logger } from './logger'
 
 // Get client identifier for rate limiting
 export function getClientIdentifier(request: NextRequest): string {
@@ -15,7 +16,10 @@ export function getClientIdentifier(request: NextRequest): string {
 }
 
 // Create rate limited response
-export function rateLimitedResponse(reset: number): NextResponse {
+export function rateLimitedResponse(reset: number, clientId?: string): NextResponse {
+  if (clientId) {
+    logger.warn('Rate limit exceeded', { clientId })
+  }
   return NextResponse.json(
     { error: 'Too many requests. Please slow down.', retryAfter: reset },
     { 

@@ -1,7 +1,7 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
-import { Square, Move } from 'chess.js'
+import { useState, useEffect, useCallback, useMemo } from 'react'
+import { Chess, Square, Move } from 'chess.js'
 import { GameState, QueueState, TurnState } from '@/lib/gameStore'
 import { useGameStream } from './useGameStream'
 import type { ConnectionStatus } from './useGameStream'
@@ -36,9 +36,8 @@ interface UseGameReturn {
 }
 
 export function useGame(): UseGameReturn {
-  // Use the stream for real-time updates
   const { gameState, queueState, connectionStatus, reconnect } = useGameStream()
-  
+
   const [playerId, setPlayerId] = useState<string | null>(null)
   const [playerName, setPlayerName] = useState<string | null>(null)
   const [playerColor, setPlayerColor] = useState<'w' | 'b' | null>(null)
@@ -47,11 +46,24 @@ export function useGame(): UseGameReturn {
   const [error, setError] = useState<string | null>(null)
   const [timeRemaining, setTimeRemaining] = useState<number>(0)
 
+  // Memoized chess instance for client-side move validation
+  const chess = useMemo(() => {
+    const c = new Chess()
+    if (gameState?.fen) {
+      try {
+        c.load(gameState.fen)
+      } catch {
+        // Invalid FEN, use default
+      }
+    }
+    return c
+  }, [gameState?.fen])
+
   // Generate player ID on mount
   useEffect(() => {
     const storedId = localStorage.getItem('chessPlayerId')
     const storedName = localStorage.getItem('chessPlayerName')
-    
+
     if (storedId) {
       setPlayerId(storedId)
     } else {
@@ -59,7 +71,7 @@ export function useGame(): UseGameReturn {
       localStorage.setItem('chessPlayerId', newId)
       setPlayerId(newId)
     }
-    
+
     if (storedName) {
       setPlayerName(storedName)
     }
@@ -69,9 +81,9 @@ export function useGame(): UseGameReturn {
   useEffect(() => {
     if (!queueState || !playerId) return
 
-    const inWhite = queueState.currentWhitePlayer?.id === playerId || 
+    const inWhite = queueState.currentWhitePlayer?.id === playerId ||
                     queueState.whiteQueue.some(p => p.id === playerId)
-    const inBlack = queueState.currentBlackPlayer?.id === playerId || 
+    const inBlack = queueState.currentBlackPlayer?.id === playerId ||
                     queueState.blackQueue.some(p => p.id === playerId)
 
     if (inWhite) {
@@ -98,7 +110,6 @@ export function useGame(): UseGameReturn {
     (gameState.turn === 'b' && queueState.currentBlackPlayer?.id === playerId)
   ) : false
 
-  // Get the turn state for the current player
   const turnState = gameState && queueState && isMyTurn ? (
     gameState.turn === 'w' ? queueState.whiteTurnState : queueState.blackTurnState
   ) : null
@@ -106,7 +117,6 @@ export function useGame(): UseGameReturn {
   const needsConfirmation = isMyTurn && turnState?.status === 'pending_confirmation'
   const isConfirmed = isMyTurn && turnState?.status === 'confirmed'
 
-  // Can only play if confirmed and not timed out
   const canPlay = isConfirmed && !gameState?.isGameOver
 
   // Calculate and update time remaining
@@ -121,10 +131,7 @@ export function useGame(): UseGameReturn {
       setTimeRemaining(remaining)
     }
 
-    // Update immediately
     updateTimer()
-
-    // Update every 100ms for smooth countdown
     const interval = setInterval(updateTimer, 100)
 
     return () => clearInterval(interval)
@@ -156,7 +163,6 @@ export function useGame(): UseGameReturn {
       if (!data.success) {
         setError(data.error || 'Failed to join queue')
       }
-      // No need to refresh - stream will update automatically
     } catch {
       setError('Failed to join queue')
     }
@@ -176,40 +182,30 @@ export function useGame(): UseGameReturn {
       })
       setSelectedSquare(null)
       setValidMoves([])
-      // No need to refresh - stream will update automatically
     } catch {
       setError('Failed to leave queue')
     }
   }, [playerId])
 
-  const fetchValidMoves = useCallback(async (square: Square): Promise<Move[]> => {
+  // Calculate valid moves client-side using chess.js - no API call needed!
+  const getValidMoves = useCallback((square: Square): Move[] => {
     try {
-      const response = await fetch('/api/game', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'validMoves',
-          from: square,
-        }),
-      })
-      const data = await response.json()
-      return data.moves || []
+      return chess.moves({ square, verbose: true })
     } catch {
       return []
     }
-  }, [])
+  }, [chess])
 
-  const selectSquare = useCallback(async (square: Square) => {
+  const selectSquare = useCallback((square: Square) => {
     if (!canPlay) return
 
-    // If clicking on a valid move target, make the move
+    // If clicking on a valid move target, don't reselect
     if (selectedSquare && validMoves.includes(square)) {
-      // Don't await here, let the move handler deal with it
       return
     }
 
-    // Select new square
-    const moves = await fetchValidMoves(square)
+    // Calculate valid moves client-side
+    const moves = getValidMoves(square)
     if (moves.length > 0) {
       setSelectedSquare(square)
       setValidMoves(moves.map(m => m.to as Square))
@@ -217,7 +213,7 @@ export function useGame(): UseGameReturn {
       setSelectedSquare(null)
       setValidMoves([])
     }
-  }, [canPlay, selectedSquare, validMoves, fetchValidMoves])
+  }, [canPlay, selectedSquare, validMoves, getValidMoves])
 
   const makeMove = useCallback(async (from: Square, to: Square, promotion?: string): Promise<boolean> => {
     if (!playerId || !canPlay) return false
@@ -235,11 +231,10 @@ export function useGame(): UseGameReturn {
         }),
       })
       const data = await response.json()
-      
+
       if (data.success) {
         setSelectedSquare(null)
         setValidMoves([])
-        // No need to refresh - stream will update automatically
         return true
       } else {
         setError(data.error || 'Invalid move')
@@ -252,7 +247,6 @@ export function useGame(): UseGameReturn {
   }, [playerId, canPlay])
 
   const resetGame = useCallback(async () => {
-    // Reset now requires admin password
     const pass = prompt('Enter admin password to reset game:')
     if (!pass) {
       setError('Reset cancelled')
@@ -269,7 +263,6 @@ export function useGame(): UseGameReturn {
         setError(data.error || 'Failed to reset game')
         return
       }
-      // No need to refresh - stream will update automatically
     } catch {
       setError('Failed to reset game')
     }
@@ -291,7 +284,6 @@ export function useGame(): UseGameReturn {
       if (!data.success) {
         setError(data.error || 'Failed to confirm')
       }
-      // No need to refresh - stream will update automatically
     } catch {
       setError('Failed to confirm ready')
     }

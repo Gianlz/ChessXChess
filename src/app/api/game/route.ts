@@ -1,6 +1,5 @@
 import { NextRequest } from 'next/server'
 import { gameStore } from '@/lib/gameStore'
-import { Chess } from 'chess.js'
 import { isRedisAvailable } from '@/lib/redis'
 import { refreshSnapshot, getSnapshot } from '@/lib/gameSnapshot'
 import { withRateLimit, secureJsonResponse, getClientIdentifier } from '@/lib/security'
@@ -14,9 +13,9 @@ import {
   validateAction,
 } from '@/lib/validation'
 import { checkRateLimit, getRateLimitHeaders } from '@/lib/ratelimit'
+import { logger } from '@/lib/logger'
 
 export async function GET(request: NextRequest) {
-  // Rate limit check
   const rateLimitResult = await withRateLimit(request, 'general')
   if (!rateLimitResult.allowed) {
     return rateLimitResult.response!
@@ -31,13 +30,14 @@ export async function GET(request: NextRequest) {
         rateLimitResult.headers
       )
     }
-    
+
     return secureJsonResponse(
       { game: snapshot.game, queue: snapshot.queue },
       200,
       rateLimitResult.headers
     )
-  } catch {
+  } catch (err) {
+    logger.error('GET /api/game failed', { error: String(err) })
     return secureJsonResponse(
       { error: 'Failed to get game state' },
       500,
@@ -49,7 +49,6 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const clientId = getClientIdentifier(request)
 
-  // General rate limit for all POST requests
   const generalLimit = await checkRateLimit(clientId, 'general')
   if (!generalLimit.success) {
     return secureJsonResponse(
@@ -75,7 +74,6 @@ export async function POST(request: NextRequest) {
 
   switch (action) {
     case 'join': {
-      // Stricter rate limit for joins
       const joinLimit = await checkRateLimit(clientId, 'join')
       if (!joinLimit.success) {
         return secureJsonResponse(
@@ -98,7 +96,7 @@ export async function POST(request: NextRequest) {
       if (!color) {
         return secureJsonResponse({ error: 'Invalid color. Must be "w" or "b".' }, 400, headers)
       }
-        
+
       if (!isRedisAvailable()) {
         return secureJsonResponse(
           { error: 'Game server not configured. Redis is required for multiplayer.', redisAvailable: false },
@@ -106,7 +104,7 @@ export async function POST(request: NextRequest) {
           headers
         )
       }
-        
+
       try {
         const success = await gameStore.joinQueue(
           { id: playerId, name: playerName, joinedAt: Date.now() },
@@ -114,9 +112,11 @@ export async function POST(request: NextRequest) {
         )
         if (success) {
           await refreshSnapshot()
+          logger.info('Player joined queue', { playerName, color })
         }
         return secureJsonResponse({ success }, 200, headers)
-      } catch {
+      } catch (err) {
+        logger.error('Join queue failed', { error: String(err), playerName })
         return secureJsonResponse(
           { success: false, error: 'Failed to join queue' },
           500,
@@ -130,13 +130,17 @@ export async function POST(request: NextRequest) {
       if (!playerId) {
         return secureJsonResponse({ error: 'Invalid player ID' }, 400, headers)
       }
-      await gameStore.leaveQueue(playerId)
-      await refreshSnapshot()
-      return secureJsonResponse({ success: true }, 200, headers)
+      try {
+        await gameStore.leaveQueue(playerId)
+        await refreshSnapshot()
+        return secureJsonResponse({ success: true }, 200, headers)
+      } catch (err) {
+        logger.error('Leave queue failed', { error: String(err) })
+        return secureJsonResponse({ success: false, error: 'Failed to leave queue' }, 500, headers)
+      }
     }
 
     case 'move': {
-      // Stricter rate limit for moves
       const moveLimit = await checkRateLimit(clientId, 'move')
       if (!moveLimit.success) {
         return secureJsonResponse(
@@ -161,13 +165,14 @@ export async function POST(request: NextRequest) {
       const result = await gameStore.makeMove(playerId, from, to, promotion)
       if (result.success) {
         await refreshSnapshot()
+        logger.info('Move made', { from, to, promotion })
       }
       return secureJsonResponse(result, result.success ? 200 : 400, headers)
     }
 
     case 'reset': {
-      // Admin action requires password
       if (!validateAdminPassword(body.pass)) {
+        logger.warn('Unauthorized reset attempt', { clientId })
         return secureJsonResponse({ error: 'Unauthorized' }, 401, headers)
       }
 
@@ -178,12 +183,13 @@ export async function POST(request: NextRequest) {
 
       await gameStore.resetGame()
       await refreshSnapshot()
+      logger.info('Game reset by admin')
       return secureJsonResponse({ success: true }, 200, headers)
     }
 
     case 'clearAll': {
-      // Admin action requires password
       if (!validateAdminPassword(body.pass)) {
+        logger.warn('Unauthorized clearAll attempt', { clientId })
         return secureJsonResponse({ error: 'Unauthorized' }, 401, headers)
       }
 
@@ -194,12 +200,13 @@ export async function POST(request: NextRequest) {
 
       await gameStore.clearAllQueues()
       await refreshSnapshot()
+      logger.info('All queues cleared by admin')
       return secureJsonResponse({ success: true, message: 'All queues cleared and game reset' }, 200, headers)
     }
 
     case 'kickPlayer': {
-      // Admin action requires password
       if (!validateAdminPassword(body.pass)) {
+        logger.warn('Unauthorized kickPlayer attempt', { clientId })
         return secureJsonResponse({ error: 'Unauthorized' }, 401, headers)
       }
 
@@ -215,33 +222,13 @@ export async function POST(request: NextRequest) {
       const found = await gameStore.kickPlayerByName(name)
       if (found) {
         await refreshSnapshot()
+        logger.info('Player kicked', { playerName: name })
       }
       return secureJsonResponse(
         { success: found, message: found ? `Player ${name} removed` : `Player ${name} not found` },
         200,
         headers
       )
-    }
-
-    case 'validMoves': {
-      const from = validateSquare(body.from)
-      if (!from) {
-        return secureJsonResponse({ error: 'Invalid square' }, 400, headers)
-      }
-      const snapshot = getSnapshot()
-      if (!snapshot) {
-        return secureJsonResponse({ moves: [] }, 200, headers)
-      }
-
-      const chess = new Chess()
-      try {
-        chess.load(snapshot.game.fen)
-      } catch {
-        return secureJsonResponse({ moves: [] }, 200, headers)
-      }
-
-      const moves = chess.moves({ square: from, verbose: true })
-      return secureJsonResponse({ moves }, 200, headers)
     }
 
     case 'confirmReady': {

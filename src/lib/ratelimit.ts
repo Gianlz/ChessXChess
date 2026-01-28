@@ -78,8 +78,8 @@ export async function checkRateLimit(
   }
 
   if (!limiter) {
-    // If Redis not available, allow request but log warning
-    return { success: true, limit: 0, remaining: 0, reset: 0 }
+    // If Redis not available, fail closed for security
+    return { success: false, limit: 0, remaining: 0, reset: Date.now() + 60000 }
   }
 
   try {
@@ -91,8 +91,8 @@ export async function checkRateLimit(
       reset: result.reset,
     }
   } catch {
-    // On rate limit error, allow request to prevent blocking
-    return { success: true, limit: 0, remaining: 0, reset: 0 }
+    // On rate limit error, fail closed for security
+    return { success: false, limit: 0, remaining: 0, reset: Date.now() + 60000 }
   }
 }
 

@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server'
-import { isRedisAvailable } from '@/lib/redis'
+import { isRedisAvailable, pingRedis } from '@/lib/redis'
 import { secureJsonResponse } from '@/lib/security'
 import { validateAdminPassword } from '@/lib/validation'
 
@@ -10,19 +10,20 @@ export async function GET(request: NextRequest) {
   const pass = url.searchParams.get('pass')
   const isAdmin = pass ? validateAdminPassword(pass) : false
 
-  // Basic health check - always available
+  // Actually test Redis connection
+  const redisHealthy = await pingRedis()
+
   const basicHealth = {
-    status: 'ok',
+    status: redisHealthy ? 'ok' : 'degraded',
     timestamp: new Date().toISOString(),
     redisAvailable: isRedisAvailable(),
+    redisHealthy,
   }
 
-  // If not admin, return only basic health
   if (!isAdmin) {
     return secureJsonResponse(basicHealth)
   }
 
-  // Admin gets more details (but still no sensitive data)
   const detailedHealth = {
     ...basicHealth,
     envVars: {
