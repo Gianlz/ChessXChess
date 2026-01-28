@@ -2,24 +2,29 @@ import { Redis } from '@upstash/redis'
 
 // Lazy singleton - created on first use
 let redisClient: Redis | null | undefined = undefined
+let initAttempts = 0
 
 // Get Redis client lazily
 export function getRedis(): Redis | null {
   // Only initialize once
   if (redisClient === undefined) {
+    initAttempts++
     const url = process.env.UPSTASH_REDIS_REST_URL
     const token = process.env.UPSTASH_REDIS_REST_TOKEN
 
+    console.log(`[Redis] Init attempt #${initAttempts}`)
+    console.log(`[Redis] URL: ${url ? url.substring(0, 30) + '...' : 'MISSING'}`)
+    console.log(`[Redis] Token: ${token ? 'present (' + token.length + ' chars)' : 'MISSING'}`)
+
     if (!url || !token) {
-      console.warn('⚠️ Upstash Redis not configured. Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN')
-      console.warn('URL present:', !!url, 'Token present:', !!token)
+      console.error('[Redis] ❌ Missing environment variables!')
       redisClient = null
     } else {
       try {
         redisClient = new Redis({ url, token })
-        console.log('✅ Upstash Redis client initialized')
+        console.log('[Redis] ✅ Client created successfully')
       } catch (err) {
-        console.error('❌ Failed to create Redis client:', err)
+        console.error('[Redis] ❌ Failed to create client:', err)
         redisClient = null
       }
     }

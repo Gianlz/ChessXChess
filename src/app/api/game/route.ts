@@ -36,19 +36,31 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
         }
         
+        console.log(`[API] Join request: ${playerName} (${playerId}) -> ${color}`)
+        console.log(`[API] Redis available: ${isRedisAvailable()}`)
+        
         if (!isRedisAvailable()) {
-          console.error('Redis not available for join action')
+          console.error('[API] Redis not available for join action')
           return NextResponse.json(
             { error: 'Game server not configured. Redis is required for multiplayer.', redisAvailable: false },
             { status: 503 }
           )
         }
         
-        const success = await gameStore.joinQueue(
-          { id: playerId, name: playerName, joinedAt: Date.now() },
-          color
-        )
-        return NextResponse.json({ success })
+        try {
+          const success = await gameStore.joinQueue(
+            { id: playerId, name: playerName, joinedAt: Date.now() },
+            color
+          )
+          console.log(`[API] Join result: ${success}`)
+          return NextResponse.json({ success })
+        } catch (err) {
+          console.error('[API] Join error:', err)
+          return NextResponse.json(
+            { success: false, error: err instanceof Error ? err.message : 'Failed to join queue' },
+            { status: 500 }
+          )
+        }
       }
 
       case 'leave': {

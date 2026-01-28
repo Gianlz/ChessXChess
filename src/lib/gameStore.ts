@@ -164,96 +164,85 @@ class InMemoryStore {
 class RedisStore {
   private async getPersistedGame(): Promise<PersistedGameState | null> {
     const redis = getRedis()
-    if (!redis) return null
-    try {
-      return await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
-    } catch (err) {
-      console.error('Redis getPersistedGame error:', err)
+    if (!redis) {
+      console.log('[Redis] getPersistedGame: no redis client')
       return null
     }
+    const result = await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
+    console.log('[Redis] getPersistedGame result:', result ? 'found' : 'null')
+    return result
   }
 
   private async setPersistedGame(state: PersistedGameState): Promise<void> {
     const redis = getRedis()
-    if (!redis) return
-    try {
-      await redis.set(REDIS_KEYS.GAME_STATE, state)
-    } catch (err) {
-      console.error('Redis setPersistedGame error:', err)
+    if (!redis) {
+      throw new Error('Redis not available for setPersistedGame')
     }
+    console.log('[Redis] setPersistedGame:', state.fen)
+    await redis.set(REDIS_KEYS.GAME_STATE, state)
   }
 
   private async getQueue(color: 'w' | 'b'): Promise<Player[]> {
     const redis = getRedis()
-    if (!redis) return []
-    try {
-      const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
-      const queue = await redis.get<Player[]>(key)
-      return queue || []
-    } catch (err) {
-      console.error('Redis getQueue error:', err)
+    if (!redis) {
+      console.log('[Redis] getQueue: no redis client')
       return []
     }
+    const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
+    const queue = await redis.get<Player[]>(key)
+    console.log(`[Redis] getQueue(${color}):`, queue?.length ?? 0, 'players')
+    return queue || []
   }
 
   private async setQueue(color: 'w' | 'b', queue: Player[]): Promise<void> {
     const redis = getRedis()
-    if (!redis) return
-    try {
-      const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
-      await redis.set(key, queue)
-    } catch (err) {
-      console.error('Redis setQueue error:', err)
+    if (!redis) {
+      throw new Error('Redis not available for setQueue')
     }
+    const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
+    console.log(`[Redis] setQueue(${color}):`, queue.length, 'players ->', key)
+    await redis.set(key, queue)
   }
 
   private async getCurrentPlayer(color: 'w' | 'b'): Promise<Player | null> {
     const redis = getRedis()
-    if (!redis) return null
-    try {
-      const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
-      return await redis.get<Player>(key)
-    } catch (err) {
-      console.error('Redis getCurrentPlayer error:', err)
+    if (!redis) {
+      console.log('[Redis] getCurrentPlayer: no redis client')
       return null
     }
+    const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
+    const player = await redis.get<Player>(key)
+    console.log(`[Redis] getCurrentPlayer(${color}):`, player?.name ?? 'null')
+    return player
   }
 
   private async setCurrentPlayer(color: 'w' | 'b', player: Player | null): Promise<void> {
     const redis = getRedis()
-    if (!redis) return
-    try {
-      const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
-      if (player) {
-        await redis.set(key, player)
-      } else {
-        await redis.del(key)
-      }
-    } catch (err) {
-      console.error('Redis setCurrentPlayer error:', err)
+    if (!redis) {
+      throw new Error('Redis not available for setCurrentPlayer')
+    }
+    const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
+    console.log(`[Redis] setCurrentPlayer(${color}):`, player?.name ?? 'null', '->', key)
+    if (player) {
+      await redis.set(key, player)
+    } else {
+      await redis.del(key)
     }
   }
 
   async getVersion(): Promise<number> {
     const redis = getRedis()
     if (!redis) return 0
-    try {
-      const version = await redis.get<number>(REDIS_KEYS.VERSION)
-      return version || 0
-    } catch (err) {
-      console.error('Redis getVersion error:', err)
-      return 0
-    }
+    const version = await redis.get<number>(REDIS_KEYS.VERSION)
+    return version || 0
   }
 
   private async incrementVersion(): Promise<void> {
     const redis = getRedis()
-    if (!redis) return
-    try {
-      await redis.incr(REDIS_KEYS.VERSION)
-    } catch (err) {
-      console.error('Redis incrementVersion error:', err)
+    if (!redis) {
+      throw new Error('Redis not available for incrementVersion')
     }
+    await redis.incr(REDIS_KEYS.VERSION)
   }
 
   async getGameState(): Promise<GameState> {
@@ -295,11 +284,17 @@ class RedisStore {
   }
 
   private async assignNextPlayer(color: 'w' | 'b'): Promise<void> {
+    console.log(`[Redis] assignNextPlayer(${color}): starting`)
     const queue = await this.getQueue(color)
+    console.log(`[Redis] assignNextPlayer(${color}): queue has ${queue.length} players`)
     if (queue.length > 0) {
       const nextPlayer = queue.shift()!
+      console.log(`[Redis] assignNextPlayer(${color}): assigning ${nextPlayer.name}`)
       await this.setQueue(color, queue)
       await this.setCurrentPlayer(color, nextPlayer)
+      console.log(`[Redis] assignNextPlayer(${color}): done`)
+    } else {
+      console.log(`[Redis] assignNextPlayer(${color}): no players in queue`)
     }
   }
 
@@ -309,20 +304,34 @@ class RedisStore {
       throw new Error('Redis not available - cannot join queue')
     }
 
+    console.log(`[Redis] joinQueue: ${player.name} -> ${color}`)
+
     const queue = await this.getQueue(color)
     const currentPlayer = await this.getCurrentPlayer(color)
 
-    if (queue.some(p => p.id === player.id)) return false
-    if (currentPlayer?.id === player.id) return false
+    // Check if already in queue or is current player
+    if (queue.some(p => p.id === player.id)) {
+      console.log(`[Redis] joinQueue: ${player.name} already in queue`)
+      return false
+    }
+    if (currentPlayer?.id === player.id) {
+      console.log(`[Redis] joinQueue: ${player.name} already current player`)
+      return false
+    }
 
+    // Add to queue
     queue.push(player)
     await this.setQueue(color, queue)
+    console.log(`[Redis] joinQueue: queue now has ${queue.length} players`)
 
+    // If no current player, assign from queue
     if (!currentPlayer) {
+      console.log(`[Redis] joinQueue: no current player, assigning from queue`)
       await this.assignNextPlayer(color)
     }
 
     await this.incrementVersion()
+    console.log(`[Redis] joinQueue: success`)
     return true
   }
 
