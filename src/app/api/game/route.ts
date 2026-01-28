@@ -84,6 +84,20 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ success: true })
       }
 
+      case 'clearAll': {
+        await gameStore.clearAllQueues()
+        return NextResponse.json({ success: true, message: 'All queues cleared and game reset' })
+      }
+
+      case 'kickPlayer': {
+        const { name } = body
+        if (!name) {
+          return NextResponse.json({ error: 'Missing player name' }, { status: 400 })
+        }
+        const found = await gameStore.kickPlayerByName(name)
+        return NextResponse.json({ success: found, message: found ? `Player ${name} removed` : `Player ${name} not found` })
+      }
+
       case 'validMoves': {
         if (!from) {
           return NextResponse.json({ error: 'Missing square' }, { status: 400 })

@@ -158,6 +158,43 @@ class InMemoryStore {
     this.lastMove = null
     this.version++
   }
+
+  clearAllQueues(): void {
+    this.whiteQueue = []
+    this.blackQueue = []
+    this.currentWhitePlayer = null
+    this.currentBlackPlayer = null
+    this.chess.reset()
+    this.lastMove = null
+    this.version++
+  }
+
+  kickPlayerByName(playerName: string): boolean {
+    let found = false
+    
+    const whiteLen = this.whiteQueue.length
+    this.whiteQueue = this.whiteQueue.filter(p => p.name !== playerName)
+    if (this.whiteQueue.length !== whiteLen) found = true
+    
+    const blackLen = this.blackQueue.length
+    this.blackQueue = this.blackQueue.filter(p => p.name !== playerName)
+    if (this.blackQueue.length !== blackLen) found = true
+    
+    if (this.currentWhitePlayer?.name === playerName) {
+      this.currentWhitePlayer = null
+      this.assignNextPlayer('w')
+      found = true
+    }
+    
+    if (this.currentBlackPlayer?.name === playerName) {
+      this.currentBlackPlayer = null
+      this.assignNextPlayer('b')
+      found = true
+    }
+    
+    if (found) this.version++
+    return found
+  }
 }
 
 // Redis-backed store for production
@@ -421,6 +458,61 @@ class RedisStore {
     })
     await this.incrementVersion()
   }
+
+  async clearAllQueues(): Promise<void> {
+    await this.setQueue('w', [])
+    await this.setQueue('b', [])
+    await this.setCurrentPlayer('w', null)
+    await this.setCurrentPlayer('b', null)
+    await this.setPersistedGame({
+      fen: new Chess().fen(),
+      lastMove: null,
+      moveHistory: [],
+    })
+    await this.incrementVersion()
+  }
+
+  async kickPlayerByName(playerName: string): Promise<boolean> {
+    let found = false
+    
+    // Check white queue
+    let whiteQueue = await this.getQueue('w')
+    const whiteFiltered = whiteQueue.filter(p => p.name !== playerName)
+    if (whiteFiltered.length !== whiteQueue.length) {
+      found = true
+      await this.setQueue('w', whiteFiltered)
+    }
+    
+    // Check black queue
+    let blackQueue = await this.getQueue('b')
+    const blackFiltered = blackQueue.filter(p => p.name !== playerName)
+    if (blackFiltered.length !== blackQueue.length) {
+      found = true
+      await this.setQueue('b', blackFiltered)
+    }
+    
+    // Check current white player
+    const currentWhite = await this.getCurrentPlayer('w')
+    if (currentWhite?.name === playerName) {
+      found = true
+      await this.setCurrentPlayer('w', null)
+      await this.assignNextPlayer('w')
+    }
+    
+    // Check current black player
+    const currentBlack = await this.getCurrentPlayer('b')
+    if (currentBlack?.name === playerName) {
+      found = true
+      await this.setCurrentPlayer('b', null)
+      await this.assignNextPlayer('b')
+    }
+    
+    if (found) {
+      await this.incrementVersion()
+    }
+    
+    return found
+  }
 }
 
 // Singleton instances
@@ -482,5 +574,19 @@ export const gameStore = {
       return await redisStore.resetGame()
     }
     return inMemoryStore.resetGame()
+  },
+
+  async clearAllQueues(): Promise<void> {
+    if (isRedisAvailable()) {
+      return await redisStore.clearAllQueues()
+    }
+    return inMemoryStore.clearAllQueues()
+  },
+
+  async kickPlayerByName(playerName: string): Promise<boolean> {
+    if (isRedisAvailable()) {
+      return await redisStore.kickPlayerByName(playerName)
+    }
+    return inMemoryStore.kickPlayerByName(playerName)
   },
 }
