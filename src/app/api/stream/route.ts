@@ -55,10 +55,10 @@ export async function GET(request: NextRequest) {
       }
 
       // Adaptive poll: start fast, back off when idle
-      let pollDelayMs = 500
+      let pollDelayMs = 200  // Start faster for better responsiveness
       let idleStreak = 0
-      const maxPollDelayMs = 5000
-      const idleThreshold = 3
+      const maxPollDelayMs = 2000  // Max 2 seconds when idle
+      const idleThreshold = 5
 
       const schedulePoll = () => {
         if (!isActive) return

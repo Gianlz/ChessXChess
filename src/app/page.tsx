@@ -10,6 +10,7 @@ import PromotionModal from '@/components/PromotionModal'
 import MusicPlayer from '@/components/MusicPlayer'
 import ShaderBackground from '@/components/ShaderBackground'
 import { useGame } from '@/hooks/useGame'
+import ConnectionStatus from '@/components/ConnectionStatus'
 
 export default function Home() {
   const {
@@ -23,12 +24,14 @@ export default function Home() {
     validMoves,
     canPlay,
     error,
+    connectionStatus,
     setPlayerName,
     joinQueue,
     leaveQueue,
     selectSquare,
     makeMove,
     resetGame,
+    reconnect,
   } = useGame()
 
   const [nameInput, setNameInput] = useState('')
@@ -156,6 +159,11 @@ export default function Home() {
       
       {/* Music Player */}
       <MusicPlayer />
+
+      {/* Connection status indicator */}
+      <div className="fixed top-4 right-4 z-50">
+        <ConnectionStatus status={connectionStatus} onReconnect={reconnect} />
+      </div>
 
       {/* Error toast */}
       {error && (

@@ -3,6 +3,10 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Square, Move } from 'chess.js'
 import { GameState, QueueState } from '@/lib/gameStore'
+import { useGameStream } from './useGameStream'
+import type { ConnectionStatus } from './useGameStream'
+
+export type { ConnectionStatus }
 
 interface UseGameReturn {
   gameState: GameState | null
@@ -16,24 +20,26 @@ interface UseGameReturn {
   isMyTurn: boolean
   canPlay: boolean
   error: string | null
+  connectionStatus: ConnectionStatus
   setPlayerName: (name: string) => void
   joinQueue: (color: 'w' | 'b') => Promise<void>
   leaveQueue: () => Promise<void>
   selectSquare: (square: Square) => void
   makeMove: (from: Square, to: Square, promotion?: string) => Promise<boolean>
   resetGame: () => Promise<void>
+  reconnect: () => void
 }
 
 export function useGame(): UseGameReturn {
-  const [gameState, setGameState] = useState<GameState | null>(null)
-  const [queueState, setQueueState] = useState<QueueState | null>(null)
+  // Use the stream for real-time updates
+  const { gameState, queueState, connectionStatus, reconnect } = useGameStream()
+  
   const [playerId, setPlayerId] = useState<string | null>(null)
   const [playerName, setPlayerName] = useState<string | null>(null)
   const [playerColor, setPlayerColor] = useState<'w' | 'b' | null>(null)
   const [selectedSquare, setSelectedSquare] = useState<Square | null>(null)
   const [validMoves, setValidMoves] = useState<Square[]>([])
   const [error, setError] = useState<string | null>(null)
-
 
   // Generate player ID on mount
   useEffect(() => {
@@ -53,23 +59,6 @@ export function useGame(): UseGameReturn {
     }
   }, [])
 
-  const refreshState = useCallback(async () => {
-    try {
-      const response = await fetch('/api/game')
-      const data = await response.json()
-      setGameState(data.game)
-      setQueueState(data.queue)
-      setError(null)
-    } catch {
-      setError('Failed to load game state')
-    }
-  }, [])
-
-  // Load state once on mount
-  useEffect(() => {
-    refreshState()
-  }, [refreshState])
-
   // Update player color based on queue state
   useEffect(() => {
     if (!queueState || !playerId) return
@@ -87,6 +76,14 @@ export function useGame(): UseGameReturn {
       setPlayerColor(null)
     }
   }, [queueState, playerId])
+
+  // Clear selection when turn changes (another player moved)
+  useEffect(() => {
+    if (gameState) {
+      setSelectedSquare(null)
+      setValidMoves([])
+    }
+  }, [gameState?.fen])
 
   const isInQueue = playerColor !== null
 
@@ -121,14 +118,13 @@ export function useGame(): UseGameReturn {
       })
       const data = await response.json()
       if (!data.success) {
-        setError('Failed to join queue')
-      } else {
-        await refreshState()
+        setError(data.error || 'Failed to join queue')
       }
+      // No need to refresh - stream will update automatically
     } catch {
       setError('Failed to join queue')
     }
-  }, [playerId, playerName, refreshState])
+  }, [playerId, playerName])
 
   const leaveQueue = useCallback(async () => {
     if (!playerId) return
@@ -144,11 +140,11 @@ export function useGame(): UseGameReturn {
       })
       setSelectedSquare(null)
       setValidMoves([])
-      await refreshState()
+      // No need to refresh - stream will update automatically
     } catch {
       setError('Failed to leave queue')
     }
-  }, [playerId, refreshState])
+  }, [playerId])
 
   const fetchValidMoves = useCallback(async (square: Square): Promise<Move[]> => {
     try {
@@ -207,7 +203,7 @@ export function useGame(): UseGameReturn {
       if (data.success) {
         setSelectedSquare(null)
         setValidMoves([])
-        await refreshState()
+        // No need to refresh - stream will update automatically
         return true
       } else {
         setError(data.error || 'Invalid move')
@@ -217,7 +213,7 @@ export function useGame(): UseGameReturn {
       setError('Failed to make move')
       return false
     }
-  }, [playerId, canPlay, refreshState])
+  }, [playerId, canPlay])
 
   const resetGame = useCallback(async () => {
     // Reset now requires admin password
@@ -237,11 +233,11 @@ export function useGame(): UseGameReturn {
         setError(data.error || 'Failed to reset game')
         return
       }
-      await refreshState()
+      // No need to refresh - stream will update automatically
     } catch {
       setError('Failed to reset game')
     }
-  }, [refreshState])
+  }, [])
 
   // Clear error after timeout
   useEffect(() => {
@@ -263,11 +259,13 @@ export function useGame(): UseGameReturn {
     isMyTurn,
     canPlay,
     error,
+    connectionStatus,
     setPlayerName: updatePlayerName,
     joinQueue,
     leaveQueue,
     selectSquare,
     makeMove,
     resetGame,
+    reconnect,
   }
 }
