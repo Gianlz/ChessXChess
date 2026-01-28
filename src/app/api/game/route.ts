@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server'
 import { gameStore } from '@/lib/gameStore'
 import { isRedisAvailable } from '@/lib/redis'
 import { refreshSnapshot } from '@/lib/gameSnapshot'
-import { withRateLimit, secureJsonResponse, getClientIdentifier } from '@/lib/security'
+import { secureJsonResponse } from '@/lib/security'
 import {
   validatePlayerId,
   sanitizePlayerName,
@@ -12,15 +12,9 @@ import {
   validateAdminPassword,
   validateAction,
 } from '@/lib/validation'
-import { checkRateLimit, getRateLimitHeaders } from '@/lib/ratelimit'
 import { logger } from '@/lib/logger'
 
-export async function GET(request: NextRequest) {
-  const rateLimitResult = await withRateLimit(request, 'general')
-  if (!rateLimitResult.allowed) {
-    return rateLimitResult.response!
-  }
-
+export async function GET() {
   try {
     // Always fetch fresh state from Redis - this is event-driven
     // since clients poll this endpoint only when they need data
@@ -29,33 +23,14 @@ export async function GET(request: NextRequest) {
       gameStore.getQueueState(),
     ])
 
-    return secureJsonResponse(
-      { game, queue },
-      200,
-      rateLimitResult.headers
-    )
+    return secureJsonResponse({ game, queue })
   } catch (err) {
     logger.error('GET /api/game failed', { error: String(err) })
-    return secureJsonResponse(
-      { error: 'Failed to get game state' },
-      500,
-      rateLimitResult.headers
-    )
+    return secureJsonResponse({ error: 'Failed to get game state' }, 500)
   }
 }
 
 export async function POST(request: NextRequest) {
-  const clientId = getClientIdentifier(request)
-
-  const generalLimit = await checkRateLimit(clientId, 'general')
-  if (!generalLimit.success) {
-    return secureJsonResponse(
-      { error: 'Too many requests. Please slow down.' },
-      429,
-      { ...getRateLimitHeaders(generalLimit), 'Retry-After': Math.ceil((generalLimit.reset - Date.now()) / 1000).toString() }
-    )
-  }
-
   let body: Record<string, unknown>
   try {
     body = await request.json()
@@ -68,38 +43,26 @@ export async function POST(request: NextRequest) {
     return secureJsonResponse({ error: 'Invalid or missing action' }, 400)
   }
 
-  const headers = getRateLimitHeaders(generalLimit)
-
   switch (action) {
     case 'join': {
-      const joinLimit = await checkRateLimit(clientId, 'join')
-      if (!joinLimit.success) {
-        return secureJsonResponse(
-          { error: 'Too many join attempts. Please wait.' },
-          429,
-          { ...getRateLimitHeaders(joinLimit), 'Retry-After': Math.ceil((joinLimit.reset - Date.now()) / 1000).toString() }
-        )
-      }
-
       const playerId = validatePlayerId(body.playerId)
       const playerName = sanitizePlayerName(body.playerName)
       const color = validateColor(body.color)
 
       if (!playerId) {
-        return secureJsonResponse({ error: 'Invalid player ID format' }, 400, headers)
+        return secureJsonResponse({ error: 'Invalid player ID format' }, 400)
       }
       if (!playerName) {
-        return secureJsonResponse({ error: 'Invalid player name. Use 1-30 alphanumeric characters.' }, 400, headers)
+        return secureJsonResponse({ error: 'Invalid player name. Use 1-30 alphanumeric characters.' }, 400)
       }
       if (!color) {
-        return secureJsonResponse({ error: 'Invalid color. Must be "w" or "b".' }, 400, headers)
+        return secureJsonResponse({ error: 'Invalid color. Must be "w" or "b".' }, 400)
       }
 
       if (!isRedisAvailable()) {
         return secureJsonResponse(
           { error: 'Game server not configured. Redis is required for multiplayer.', redisAvailable: false },
-          503,
-          headers
+          503
         )
       }
 
@@ -112,52 +75,39 @@ export async function POST(request: NextRequest) {
           await refreshSnapshot()
           logger.info('Player joined queue', { playerName, color })
         }
-        return secureJsonResponse({ success }, 200, headers)
+        return secureJsonResponse({ success })
       } catch (err) {
         logger.error('Join queue failed', { error: String(err), playerName })
-        return secureJsonResponse(
-          { success: false, error: 'Failed to join queue' },
-          500,
-          headers
-        )
+        return secureJsonResponse({ success: false, error: 'Failed to join queue' }, 500)
       }
     }
 
     case 'leave': {
       const playerId = validatePlayerId(body.playerId)
       if (!playerId) {
-        return secureJsonResponse({ error: 'Invalid player ID' }, 400, headers)
+        return secureJsonResponse({ error: 'Invalid player ID' }, 400)
       }
       try {
         await gameStore.leaveQueue(playerId)
         await refreshSnapshot()
-        return secureJsonResponse({ success: true }, 200, headers)
+        return secureJsonResponse({ success: true })
       } catch (err) {
         logger.error('Leave queue failed', { error: String(err) })
-        return secureJsonResponse({ success: false, error: 'Failed to leave queue' }, 500, headers)
+        return secureJsonResponse({ success: false, error: 'Failed to leave queue' }, 500)
       }
     }
 
     case 'move': {
-      const moveLimit = await checkRateLimit(clientId, 'move')
-      if (!moveLimit.success) {
-        return secureJsonResponse(
-          { error: 'Too many move attempts. Please slow down.' },
-          429,
-          { ...getRateLimitHeaders(moveLimit), 'Retry-After': Math.ceil((moveLimit.reset - Date.now()) / 1000).toString() }
-        )
-      }
-
       const playerId = validatePlayerId(body.playerId)
       const from = validateSquare(body.from)
       const to = validateSquare(body.to)
       const promotion = validatePromotion(body.promotion)
 
       if (!playerId) {
-        return secureJsonResponse({ error: 'Invalid player ID' }, 400, headers)
+        return secureJsonResponse({ error: 'Invalid player ID' }, 400)
       }
       if (!from || !to) {
-        return secureJsonResponse({ error: 'Invalid square format' }, 400, headers)
+        return secureJsonResponse({ error: 'Invalid square format' }, 400)
       }
 
       const result = await gameStore.makeMove(playerId, from, to, promotion)
@@ -165,57 +115,42 @@ export async function POST(request: NextRequest) {
         await refreshSnapshot()
         logger.info('Move made', { from, to, promotion })
       }
-      return secureJsonResponse(result, result.success ? 200 : 400, headers)
+      return secureJsonResponse(result, result.success ? 200 : 400)
     }
 
     case 'reset': {
       if (!validateAdminPassword(body.pass)) {
-        logger.warn('Unauthorized reset attempt', { clientId })
-        return secureJsonResponse({ error: 'Unauthorized' }, 401, headers)
-      }
-
-      const adminLimit = await checkRateLimit(clientId, 'admin')
-      if (!adminLimit.success) {
-        return secureJsonResponse({ error: 'Too many admin actions' }, 429, headers)
+        logger.warn('Unauthorized reset attempt')
+        return secureJsonResponse({ error: 'Unauthorized' }, 401)
       }
 
       await gameStore.resetGame()
       await refreshSnapshot()
       logger.info('Game reset by admin')
-      return secureJsonResponse({ success: true }, 200, headers)
+      return secureJsonResponse({ success: true })
     }
 
     case 'clearAll': {
       if (!validateAdminPassword(body.pass)) {
-        logger.warn('Unauthorized clearAll attempt', { clientId })
-        return secureJsonResponse({ error: 'Unauthorized' }, 401, headers)
-      }
-
-      const adminLimit = await checkRateLimit(clientId, 'admin')
-      if (!adminLimit.success) {
-        return secureJsonResponse({ error: 'Too many admin actions' }, 429, headers)
+        logger.warn('Unauthorized clearAll attempt')
+        return secureJsonResponse({ error: 'Unauthorized' }, 401)
       }
 
       await gameStore.clearAllQueues()
       await refreshSnapshot()
       logger.info('All queues cleared by admin')
-      return secureJsonResponse({ success: true, message: 'All queues cleared and game reset' }, 200, headers)
+      return secureJsonResponse({ success: true, message: 'All queues cleared and game reset' })
     }
 
     case 'kickPlayer': {
       if (!validateAdminPassword(body.pass)) {
-        logger.warn('Unauthorized kickPlayer attempt', { clientId })
-        return secureJsonResponse({ error: 'Unauthorized' }, 401, headers)
-      }
-
-      const adminLimit = await checkRateLimit(clientId, 'admin')
-      if (!adminLimit.success) {
-        return secureJsonResponse({ error: 'Too many admin actions' }, 429, headers)
+        logger.warn('Unauthorized kickPlayer attempt')
+        return secureJsonResponse({ error: 'Unauthorized' }, 401)
       }
 
       const name = sanitizePlayerName(body.name)
       if (!name) {
-        return secureJsonResponse({ error: 'Invalid player name' }, 400, headers)
+        return secureJsonResponse({ error: 'Invalid player name' }, 400)
       }
       const found = await gameStore.kickPlayerByName(name)
       if (found) {
@@ -223,25 +158,23 @@ export async function POST(request: NextRequest) {
         logger.info('Player kicked', { playerName: name })
       }
       return secureJsonResponse(
-        { success: found, message: found ? `Player ${name} removed` : `Player ${name} not found` },
-        200,
-        headers
+        { success: found, message: found ? `Player ${name} removed` : `Player ${name} not found` }
       )
     }
 
     case 'confirmReady': {
       const playerId = validatePlayerId(body.playerId)
       if (!playerId) {
-        return secureJsonResponse({ error: 'Invalid player ID' }, 400, headers)
+        return secureJsonResponse({ error: 'Invalid player ID' }, 400)
       }
       const result = await gameStore.confirmReady(playerId)
       if (result.success) {
         await refreshSnapshot()
       }
-      return secureJsonResponse(result, result.success ? 200 : 400, headers)
+      return secureJsonResponse(result, result.success ? 200 : 400)
     }
 
     default:
-      return secureJsonResponse({ error: 'Unknown action' }, 400, headers)
+      return secureJsonResponse({ error: 'Unknown action' }, 400)
   }
 }

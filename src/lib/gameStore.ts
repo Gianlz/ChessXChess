@@ -123,21 +123,38 @@ function deriveQueueState(state: ConsolidatedState): QueueState {
 }
 
 // Assign next player from queue
+// Note: Only sets turn state if it's currently this color's turn
 function assignNextPlayer(state: ConsolidatedState, color: 'w' | 'b'): void {
   const queue = color === 'w' ? state.queues.white : state.queues.black
+  const currentTurn = getTurnFromFen(state.game.fen)
 
   if (queue.length > 0) {
     const nextPlayer = queue.shift()!
-    const turnState: TurnState = {
-      status: 'pending_confirmation',
-      deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
-    }
+    
     if (color === 'w') {
       state.current.white = nextPlayer
-      state.turns.white = turnState
+      // Only set turn state if it's actually white's turn
+      if (currentTurn === 'w') {
+        state.turns.white = {
+          status: 'pending_confirmation',
+          deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
+        }
+      } else {
+        // Not white's turn yet - don't set a deadline
+        state.turns.white = null
+      }
     } else {
       state.current.black = nextPlayer
-      state.turns.black = turnState
+      // Only set turn state if it's actually black's turn
+      if (currentTurn === 'b') {
+        state.turns.black = {
+          status: 'pending_confirmation',
+          deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
+        }
+      } else {
+        // Not black's turn yet - don't set a deadline
+        state.turns.black = null
+      }
     }
   } else {
     if (color === 'w') {
@@ -150,27 +167,72 @@ function assignNextPlayer(state: ConsolidatedState, color: 'w' | 'b'): void {
   }
 }
 
+// Initialize turn state for the current turn's player if they don't have one
+// Called after a move to start the new turn's confirmation timer
+function initializeTurnStateIfNeeded(state: ConsolidatedState): void {
+  const currentTurn = getTurnFromFen(state.game.fen)
+  
+  if (currentTurn === 'w') {
+    // It's white's turn - if there's a current white player without turn state, initialize it
+    if (state.current.white && !state.turns.white) {
+      state.turns.white = {
+        status: 'pending_confirmation',
+        deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
+      }
+    }
+  } else {
+    // It's black's turn - if there's a current black player without turn state, initialize it
+    if (state.current.black && !state.turns.black) {
+      state.turns.black = {
+        status: 'pending_confirmation',
+        deadline: Date.now() + CONFIRMATION_TIMEOUT_MS,
+      }
+    }
+  }
+}
+
 // Check and expire turns - called lazily on state access
+// Also initializes turn state for waiting players
 function checkAndExpireTurnsInline(state: ConsolidatedState): boolean {
   const now = Date.now()
   const turn = getTurnFromFen(state.game.fen)
   let changed = false
 
   // Only check the current turn's player
-  if (turn === 'w' && state.current.white && state.turns.white) {
-    if (now > state.turns.white.deadline) {
-      logger.info('Turn expired', { player: state.current.white.name, color: 'white' })
-      state.current.white = null
-      state.turns.white = null
-      assignNextPlayer(state, 'w')
+  if (turn === 'w' && state.current.white) {
+    if (state.turns.white) {
+      // Check if deadline expired
+      if (now > state.turns.white.deadline) {
+        logger.info('Turn expired', { player: state.current.white.name, color: 'white' })
+        state.current.white = null
+        state.turns.white = null
+        assignNextPlayer(state, 'w')
+        changed = true
+      }
+    } else {
+      // Player is waiting but has no turn state - initialize it now
+      state.turns.white = {
+        status: 'pending_confirmation',
+        deadline: now + CONFIRMATION_TIMEOUT_MS,
+      }
       changed = true
     }
-  } else if (turn === 'b' && state.current.black && state.turns.black) {
-    if (now > state.turns.black.deadline) {
-      logger.info('Turn expired', { player: state.current.black.name, color: 'black' })
-      state.current.black = null
-      state.turns.black = null
-      assignNextPlayer(state, 'b')
+  } else if (turn === 'b' && state.current.black) {
+    if (state.turns.black) {
+      // Check if deadline expired
+      if (now > state.turns.black.deadline) {
+        logger.info('Turn expired', { player: state.current.black.name, color: 'black' })
+        state.current.black = null
+        state.turns.black = null
+        assignNextPlayer(state, 'b')
+        changed = true
+      }
+    } else {
+      // Player is waiting but has no turn state - initialize it now
+      state.turns.black = {
+        status: 'pending_confirmation',
+        deadline: now + CONFIRMATION_TIMEOUT_MS,
+      }
       changed = true
     }
   }
@@ -307,7 +369,7 @@ class InMemoryStore {
         const queue = currentTurn === 'w' ? state.queues.white : state.queues.black
         queue.push(currentPlayer)
 
-        // Clear current and assign next
+        // Clear current and assign next for the color that just moved
         if (currentTurn === 'w') {
           state.current.white = null
           state.turns.white = null
@@ -317,6 +379,9 @@ class InMemoryStore {
           state.turns.black = null
           assignNextPlayer(state, 'b')
         }
+
+        // Initialize turn state for the NEW turn's player (who may be waiting)
+        initializeTurnStateIfNeeded(state)
 
         state.version++
         return { success: true }
@@ -591,7 +656,7 @@ class RedisStore {
         const queue = currentTurn === 'w' ? state.queues.white : state.queues.black
         queue.push(currentPlayer)
 
-        // Clear current and assign next
+        // Clear current and assign next for the color that just moved
         if (currentTurn === 'w') {
           state.current.white = null
           state.turns.white = null
@@ -601,6 +666,9 @@ class RedisStore {
           state.turns.black = null
           assignNextPlayer(state, 'b')
         }
+
+        // Initialize turn state for the NEW turn's player (who may be waiting)
+        initializeTurnStateIfNeeded(state)
 
         return { success: true }
       } catch {

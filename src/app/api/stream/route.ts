@@ -1,7 +1,5 @@
 import { NextRequest } from 'next/server'
 import { gameStore } from '@/lib/gameStore'
-import { getClientIdentifier } from '@/lib/security'
-import { checkRateLimit } from '@/lib/ratelimit'
 import { logger } from '@/lib/logger'
 
 export const dynamic = 'force-dynamic'
@@ -13,23 +11,6 @@ export const maxDuration = 60
 // which achieves true event-only Redis operations.
 
 export async function GET(request: NextRequest) {
-  const clientId = getClientIdentifier(request)
-  const rateLimitResult = await checkRateLimit(clientId, 'general')
-  
-  if (!rateLimitResult.success) {
-    logger.warn('Stream rate limited', { clientId })
-    return new Response(
-      JSON.stringify({ error: 'Too many connections. Please wait.' }),
-      {
-        status: 429,
-        headers: {
-          'Content-Type': 'application/json',
-          'Retry-After': Math.ceil((rateLimitResult.reset - Date.now()) / 1000).toString(),
-        },
-      }
-    )
-  }
-
   const encoder = new TextEncoder()
   let isActive = true
 
