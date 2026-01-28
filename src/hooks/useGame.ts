@@ -53,29 +53,61 @@ export function useGame(): UseGameReturn {
     }
   }, [])
 
-  // Connect to SSE stream
+  // Connect to SSE stream with auto-reconnect
   useEffect(() => {
-    const eventSource = new EventSource('/api/stream')
+    let eventSource: EventSource | null = null
+    let reconnectTimeout: NodeJS.Timeout | null = null
+    let isUnmounted = false
 
-    eventSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data)
-        setGameState(data.game)
-        setQueueState(data.queue)
-      } catch {
-        // Ignore parse errors (heartbeats)
+    const connect = () => {
+      if (isUnmounted) return
+      
+      eventSource = new EventSource('/api/stream')
+
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          setGameState(data.game)
+          setQueueState(data.queue)
+          setError(null)
+        } catch {
+          // Ignore parse errors (heartbeats)
+        }
+      }
+
+      eventSource.onerror = () => {
+        if (isUnmounted) return
+        
+        eventSource?.close()
+        
+        // Fetch current state immediately to avoid missing updates
+        fetch('/api/game')
+          .then(r => r.json())
+          .then(data => {
+            if (!isUnmounted) {
+              setGameState(data.game)
+              setQueueState(data.queue)
+            }
+          })
+          .catch(() => {})
+        
+        // Reconnect after a short delay
+        reconnectTimeout = setTimeout(() => {
+          if (!isUnmounted) {
+            connect()
+          }
+        }, 1000)
       }
     }
 
-    eventSource.onerror = () => {
-      setError('Connection lost. Reconnecting...')
-      setTimeout(() => {
-        setError(null)
-      }, 2000)
-    }
+    connect()
 
     return () => {
-      eventSource.close()
+      isUnmounted = true
+      eventSource?.close()
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout)
+      }
     }
   }, [])
 

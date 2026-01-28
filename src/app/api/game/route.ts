@@ -3,8 +3,10 @@ import { gameStore } from '@/lib/gameStore'
 import { Square } from 'chess.js'
 
 export async function GET() {
-  const gameState = gameStore.getGameState()
-  const queueState = gameStore.getQueueState()
+  const [gameState, queueState] = await Promise.all([
+    gameStore.getGameState(),
+    gameStore.getQueueState(),
+  ])
   
   return NextResponse.json({
     game: gameState,
@@ -21,7 +23,7 @@ export async function POST(request: NextRequest) {
       if (!playerId || !playerName || !color) {
         return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
       }
-      const success = gameStore.joinQueue(
+      const success = await gameStore.joinQueue(
         { id: playerId, name: playerName, joinedAt: Date.now() },
         color
       )
@@ -32,7 +34,7 @@ export async function POST(request: NextRequest) {
       if (!playerId) {
         return NextResponse.json({ error: 'Missing playerId' }, { status: 400 })
       }
-      gameStore.leaveQueue(playerId)
+      await gameStore.leaveQueue(playerId)
       return NextResponse.json({ success: true })
     }
 
@@ -40,12 +42,12 @@ export async function POST(request: NextRequest) {
       if (!playerId || !from || !to) {
         return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
       }
-      const result = gameStore.makeMove(playerId, from as Square, to as Square, promotion)
+      const result = await gameStore.makeMove(playerId, from as Square, to as Square, promotion)
       return NextResponse.json(result)
     }
 
     case 'reset': {
-      gameStore.resetGame()
+      await gameStore.resetGame()
       return NextResponse.json({ success: true })
     }
 
@@ -53,7 +55,7 @@ export async function POST(request: NextRequest) {
       if (!from) {
         return NextResponse.json({ error: 'Missing square' }, { status: 400 })
       }
-      const moves = gameStore.getValidMoves(from as Square)
+      const moves = await gameStore.getValidMoves(from as Square)
       return NextResponse.json({ moves })
     }
 

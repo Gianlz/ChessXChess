@@ -1,4 +1,5 @@
 import { Chess, Square, Move } from 'chess.js'
+import { redis, REDIS_KEYS } from './redis'
 
 export interface Player {
   id: string
@@ -26,18 +27,21 @@ export interface QueueState {
   currentBlackPlayer: Player | null
 }
 
-class GameStore {
-  private chess: Chess
+export interface PersistedGameState {
+  fen: string
+  lastMove: { from: Square; to: Square } | null
+  moveHistory: string[]
+}
+
+// In-memory fallback for local development without Redis
+class InMemoryStore {
+  private chess: Chess = new Chess()
   private whiteQueue: Player[] = []
   private blackQueue: Player[] = []
   private currentWhitePlayer: Player | null = null
   private currentBlackPlayer: Player | null = null
   private lastMove: { from: Square; to: Square } | null = null
-  private listeners: Set<() => void> = new Set()
-
-  constructor() {
-    this.chess = new Chess()
-  }
+  private version: number = 0
 
   getGameState(): GameState {
     return {
@@ -63,22 +67,24 @@ class GameStore {
     }
   }
 
+  getVersion(): number {
+    return this.version
+  }
+
   joinQueue(player: Player, color: 'w' | 'b'): boolean {
     const queue = color === 'w' ? this.whiteQueue : this.blackQueue
     const currentPlayer = color === 'w' ? this.currentWhitePlayer : this.currentBlackPlayer
 
-    // Check if player is already in queue or playing
     if (queue.some(p => p.id === player.id)) return false
     if (currentPlayer?.id === player.id) return false
 
     queue.push(player)
 
-    // If no current player, assign this one
     if (!currentPlayer) {
       this.assignNextPlayer(color)
     }
 
-    this.notifyListeners()
+    this.version++
     return true
   }
 
@@ -95,7 +101,7 @@ class GameStore {
       this.assignNextPlayer('b')
     }
 
-    this.notifyListeners()
+    this.version++
   }
 
   private assignNextPlayer(color: 'w' | 'b'): void {
@@ -114,7 +120,6 @@ class GameStore {
     const currentTurn = this.chess.turn()
     const currentPlayer = currentTurn === 'w' ? this.currentWhitePlayer : this.currentBlackPlayer
 
-    // Check if it's this player's turn
     if (currentPlayer?.id !== playerId) {
       return { success: false, error: 'Not your turn' }
     }
@@ -124,7 +129,6 @@ class GameStore {
       if (move) {
         this.lastMove = { from, to }
         
-        // Move current player to back of queue and assign next
         const queue = currentTurn === 'w' ? this.whiteQueue : this.blackQueue
         queue.push(currentPlayer)
         
@@ -136,7 +140,7 @@ class GameStore {
           this.assignNextPlayer('b')
         }
 
-        this.notifyListeners()
+        this.version++
         return { success: true }
       }
       return { success: false, error: 'Invalid move' }
@@ -152,18 +156,273 @@ class GameStore {
   resetGame(): void {
     this.chess.reset()
     this.lastMove = null
-    this.notifyListeners()
-  }
-
-  subscribe(listener: () => void): () => void {
-    this.listeners.add(listener)
-    return () => this.listeners.delete(listener)
-  }
-
-  private notifyListeners(): void {
-    this.listeners.forEach(listener => listener())
+    this.version++
   }
 }
 
-// Singleton instance
-export const gameStore = new GameStore()
+// Redis-backed store for production
+class RedisStore {
+  private async getPersistedGame(): Promise<PersistedGameState | null> {
+    if (!redis) return null
+    return await redis.get<PersistedGameState>(REDIS_KEYS.GAME_STATE)
+  }
+
+  private async setPersistedGame(state: PersistedGameState): Promise<void> {
+    if (!redis) return
+    await redis.set(REDIS_KEYS.GAME_STATE, state)
+  }
+
+  private async getQueue(color: 'w' | 'b'): Promise<Player[]> {
+    if (!redis) return []
+    const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
+    const queue = await redis.get<Player[]>(key)
+    return queue || []
+  }
+
+  private async setQueue(color: 'w' | 'b', queue: Player[]): Promise<void> {
+    if (!redis) return
+    const key = color === 'w' ? REDIS_KEYS.WHITE_QUEUE : REDIS_KEYS.BLACK_QUEUE
+    await redis.set(key, queue)
+  }
+
+  private async getCurrentPlayer(color: 'w' | 'b'): Promise<Player | null> {
+    if (!redis) return null
+    const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
+    return await redis.get<Player>(key)
+  }
+
+  private async setCurrentPlayer(color: 'w' | 'b', player: Player | null): Promise<void> {
+    if (!redis) return
+    const key = color === 'w' ? REDIS_KEYS.CURRENT_WHITE : REDIS_KEYS.CURRENT_BLACK
+    if (player) {
+      await redis.set(key, player)
+    } else {
+      await redis.del(key)
+    }
+  }
+
+  async getVersion(): Promise<number> {
+    if (!redis) return 0
+    const version = await redis.get<number>(REDIS_KEYS.VERSION)
+    return version || 0
+  }
+
+  private async incrementVersion(): Promise<void> {
+    if (!redis) return
+    await redis.incr(REDIS_KEYS.VERSION)
+  }
+
+  async getGameState(): Promise<GameState> {
+    const persisted = await this.getPersistedGame()
+    const chess = new Chess()
+    
+    if (persisted?.fen) {
+      chess.load(persisted.fen)
+    }
+
+    return {
+      fen: chess.fen(),
+      turn: chess.turn(),
+      isGameOver: chess.isGameOver(),
+      isCheckmate: chess.isCheckmate(),
+      isStalemate: chess.isStalemate(),
+      isDraw: chess.isDraw(),
+      isCheck: chess.isCheck(),
+      winner: chess.isCheckmate() ? (chess.turn() === 'w' ? 'b' : 'w') : null,
+      lastMove: persisted?.lastMove || null,
+      moveHistory: persisted?.moveHistory || [],
+    }
+  }
+
+  async getQueueState(): Promise<QueueState> {
+    const [whiteQueue, blackQueue, currentWhitePlayer, currentBlackPlayer] = await Promise.all([
+      this.getQueue('w'),
+      this.getQueue('b'),
+      this.getCurrentPlayer('w'),
+      this.getCurrentPlayer('b'),
+    ])
+
+    return {
+      whiteQueue,
+      blackQueue,
+      currentWhitePlayer,
+      currentBlackPlayer,
+    }
+  }
+
+  private async assignNextPlayer(color: 'w' | 'b'): Promise<void> {
+    const queue = await this.getQueue(color)
+    if (queue.length > 0) {
+      const nextPlayer = queue.shift()!
+      await this.setQueue(color, queue)
+      await this.setCurrentPlayer(color, nextPlayer)
+    }
+  }
+
+  async joinQueue(player: Player, color: 'w' | 'b'): Promise<boolean> {
+    const queue = await this.getQueue(color)
+    const currentPlayer = await this.getCurrentPlayer(color)
+
+    if (queue.some(p => p.id === player.id)) return false
+    if (currentPlayer?.id === player.id) return false
+
+    queue.push(player)
+    await this.setQueue(color, queue)
+
+    if (!currentPlayer) {
+      await this.assignNextPlayer(color)
+    }
+
+    await this.incrementVersion()
+    return true
+  }
+
+  async leaveQueue(playerId: string): Promise<void> {
+    let whiteQueue = await this.getQueue('w')
+    let blackQueue = await this.getQueue('b')
+    const currentWhite = await this.getCurrentPlayer('w')
+    const currentBlack = await this.getCurrentPlayer('b')
+
+    whiteQueue = whiteQueue.filter(p => p.id !== playerId)
+    blackQueue = blackQueue.filter(p => p.id !== playerId)
+
+    await this.setQueue('w', whiteQueue)
+    await this.setQueue('b', blackQueue)
+
+    if (currentWhite?.id === playerId) {
+      await this.setCurrentPlayer('w', null)
+      await this.assignNextPlayer('w')
+    }
+    if (currentBlack?.id === playerId) {
+      await this.setCurrentPlayer('b', null)
+      await this.assignNextPlayer('b')
+    }
+
+    await this.incrementVersion()
+  }
+
+  async makeMove(playerId: string, from: Square, to: Square, promotion?: string): Promise<{ success: boolean; error?: string }> {
+    const persisted = await this.getPersistedGame()
+    const chess = new Chess()
+    
+    if (persisted?.fen) {
+      chess.load(persisted.fen)
+    }
+
+    const currentTurn = chess.turn()
+    const currentPlayer = await this.getCurrentPlayer(currentTurn)
+
+    if (currentPlayer?.id !== playerId) {
+      return { success: false, error: 'Not your turn' }
+    }
+
+    try {
+      const move = chess.move({ from, to, promotion })
+      if (move) {
+        // Save game state
+        await this.setPersistedGame({
+          fen: chess.fen(),
+          lastMove: { from, to },
+          moveHistory: chess.history(),
+        })
+        
+        // Move current player to back of queue
+        const queue = await this.getQueue(currentTurn)
+        queue.push(currentPlayer)
+        await this.setQueue(currentTurn, queue)
+        
+        // Assign next player
+        await this.setCurrentPlayer(currentTurn, null)
+        await this.assignNextPlayer(currentTurn)
+
+        await this.incrementVersion()
+        return { success: true }
+      }
+      return { success: false, error: 'Invalid move' }
+    } catch {
+      return { success: false, error: 'Invalid move' }
+    }
+  }
+
+  async getValidMoves(square: Square): Promise<Move[]> {
+    const persisted = await this.getPersistedGame()
+    const chess = new Chess()
+    
+    if (persisted?.fen) {
+      chess.load(persisted.fen)
+    }
+
+    return chess.moves({ square, verbose: true })
+  }
+
+  async resetGame(): Promise<void> {
+    await this.setPersistedGame({
+      fen: new Chess().fen(),
+      lastMove: null,
+      moveHistory: [],
+    })
+    await this.incrementVersion()
+  }
+}
+
+// Use Redis if available, otherwise fall back to in-memory
+const inMemoryStore = new InMemoryStore()
+const redisStore = new RedisStore()
+
+export const gameStore = {
+  async getGameState(): Promise<GameState> {
+    if (redis) {
+      return await redisStore.getGameState()
+    }
+    return inMemoryStore.getGameState()
+  },
+
+  async getQueueState(): Promise<QueueState> {
+    if (redis) {
+      return await redisStore.getQueueState()
+    }
+    return inMemoryStore.getQueueState()
+  },
+
+  async getVersion(): Promise<number> {
+    if (redis) {
+      return await redisStore.getVersion()
+    }
+    return inMemoryStore.getVersion()
+  },
+
+  async joinQueue(player: Player, color: 'w' | 'b'): Promise<boolean> {
+    if (redis) {
+      return await redisStore.joinQueue(player, color)
+    }
+    return inMemoryStore.joinQueue(player, color)
+  },
+
+  async leaveQueue(playerId: string): Promise<void> {
+    if (redis) {
+      return await redisStore.leaveQueue(playerId)
+    }
+    return inMemoryStore.leaveQueue(playerId)
+  },
+
+  async makeMove(playerId: string, from: Square, to: Square, promotion?: string): Promise<{ success: boolean; error?: string }> {
+    if (redis) {
+      return await redisStore.makeMove(playerId, from, to, promotion)
+    }
+    return inMemoryStore.makeMove(playerId, from, to, promotion)
+  },
+
+  async getValidMoves(square: Square): Promise<Move[]> {
+    if (redis) {
+      return await redisStore.getValidMoves(square)
+    }
+    return inMemoryStore.getValidMoves(square)
+  },
+
+  async resetGame(): Promise<void> {
+    if (redis) {
+      return await redisStore.resetGame()
+    }
+    return inMemoryStore.resetGame()
+  },
+}

@@ -70,10 +70,27 @@ Open [http://localhost:3000](http://localhost:3000) to play!
 
 ### Environment Variables
 
-No environment variables are required for basic deployment. The app uses:
-- In-memory game state (resets on redeploy)
-- Local storage for user preferences
-- No external database required
+**Required for production:**
+
+1. **Create Upstash Redis Database**
+   - Go to [console.upstash.com](https://console.upstash.com)
+   - Sign up (free tier is sufficient)
+   - Create a new Redis database
+   - Copy the REST URL and Token
+
+2. **Add to Vercel Environment Variables**
+   - In your Vercel project, go to Settings → Environment Variables
+   - Add:
+     - `UPSTASH_REDIS_REST_URL` = your REST URL
+     - `UPSTASH_REDIS_REST_TOKEN` = your REST Token
+
+3. **Redeploy**
+   - Trigger a new deployment for changes to take effect
+
+**Why Redis?**
+- Vercel uses serverless functions that don't share memory
+- Redis provides shared state across all instances
+- Free tier: 10,000 commands/day (plenty for casual play)
 
 ## 🎮 How to Play
 
