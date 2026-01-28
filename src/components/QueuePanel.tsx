@@ -1,12 +1,15 @@
 'use client'
 
-import { Player } from '@/lib/gameStore'
+import { useState, useEffect } from 'react'
+import { Player, TurnState } from '@/lib/gameStore'
 
 interface QueuePanelProps {
   whiteQueue: Player[]
   blackQueue: Player[]
   currentWhitePlayer: Player | null
   currentBlackPlayer: Player | null
+  whiteTurnState: TurnState | null
+  blackTurnState: TurnState | null
   currentPlayerId: string | null
   turn: 'w' | 'b'
   onJoinQueue: (color: 'w' | 'b') => void
@@ -15,11 +18,43 @@ interface QueuePanelProps {
   playerColor: 'w' | 'b' | null
 }
 
+function CountdownTimer({ deadline, isActive }: { deadline: number; isActive: boolean }) {
+  const [timeLeft, setTimeLeft] = useState(0)
+
+  useEffect(() => {
+    if (!isActive) {
+      setTimeLeft(0)
+      return
+    }
+
+    const update = () => {
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000))
+      setTimeLeft(remaining)
+    }
+
+    update()
+    const interval = setInterval(update, 100)
+    return () => clearInterval(interval)
+  }, [deadline, isActive])
+
+  if (!isActive || timeLeft === 0) return null
+
+  const isUrgent = timeLeft <= 5
+
+  return (
+    <span className={`ml-2 font-mono text-xs ${isUrgent ? 'text-red-400 animate-pulse' : 'text-gray-400'}`}>
+      ({timeLeft}s)
+    </span>
+  )
+}
+
 export default function QueuePanel({
   whiteQueue,
   blackQueue,
   currentWhitePlayer,
   currentBlackPlayer,
+  whiteTurnState,
+  blackTurnState,
   currentPlayerId,
   turn,
   onJoinQueue,
@@ -27,125 +62,115 @@ export default function QueuePanel({
   isInQueue,
   playerColor,
 }: QueuePanelProps) {
-  const isCurrentPlayer = (player: Player | null) => player?.id === currentPlayerId
-  const isMyTurn = (color: 'w' | 'b') => {
-    const currentPlayer = color === 'w' ? currentWhitePlayer : currentBlackPlayer
-    return turn === color && currentPlayer?.id === currentPlayerId
-  }
-
-  const renderPlayerList = (players: Player[], current: Player | null, color: 'w' | 'b') => {
-    const colorName = color === 'w' ? 'White' : 'Black'
-    const isActive = turn === color
+  const renderQueue = (
+    color: 'w' | 'b',
+    queue: Player[],
+    currentPlayer: Player | null,
+    turnState: TurnState | null
+  ) => {
+    const isCurrentTurn = turn === color
+    const colorLabel = color === 'w' ? 'White' : 'Black'
+    const bgClass = color === 'w' ? 'bg-white/10' : 'bg-black/30'
+    const accentClass = color === 'w' ? 'text-white' : 'text-gray-300'
 
     return (
-      <div className={`flex-1 ${color === 'w' ? 'pr-3' : 'pl-3'}`}>
-        <div className="flex items-center gap-2 mb-3">
-          <div className={`w-4 h-4 rounded-full ${color === 'w' ? 'bg-white' : 'bg-gray-900'} ring-1 ring-white/20`} />
-          <h3 className="text-sm font-semibold uppercase tracking-wider text-gray-400">
-            {colorName}
+      <div className={`${bgClass} rounded-xl p-4`}>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className={`font-medium ${accentClass}`}>
+            {color === 'w' ? '♔' : '♚'} {colorLabel}
           </h3>
-          {isActive && (
-            <span className="ml-auto px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-chess-accent/20 text-chess-accent rounded-full animate-pulse">
-              Playing
+          {isCurrentTurn && (
+            <span className="text-xs px-2 py-0.5 bg-chess-accent/20 text-chess-accent rounded-full">
+              Turn
             </span>
           )}
         </div>
 
         {/* Current player */}
-        {current ? (
-          <div className={`p-3 rounded-lg mb-2 transition-all ${
-            isActive ? 'bg-chess-accent/20 ring-1 ring-chess-accent/50' : 'bg-white/5'
-          } ${isCurrentPlayer(current) ? 'ring-2 ring-yellow-400/50' : ''}`}>
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-green-400 animate-pulse' : 'bg-gray-500'}`} />
-              <span className={`text-sm font-medium ${isCurrentPlayer(current) ? 'text-yellow-400' : 'text-white'}`}>
-                {current.name}
-                {isCurrentPlayer(current) && ' (You)'}
+        <div className="mb-3">
+          <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Now Playing</p>
+          {currentPlayer ? (
+            <div className={`flex items-center justify-between p-2 rounded-lg ${
+              currentPlayer.id === currentPlayerId ? 'bg-chess-accent/20 border border-chess-accent/30' : 'bg-white/5'
+            }`}>
+              <span className={currentPlayer.id === currentPlayerId ? 'text-chess-accent font-medium' : 'text-white'}>
+                {currentPlayer.name}
+                {currentPlayer.id === currentPlayerId && ' (You)'}
               </span>
+              {isCurrentTurn && turnState && (
+                <div className="flex items-center">
+                  <span className={`text-xs px-1.5 py-0.5 rounded ${
+                    turnState.status === 'pending_confirmation' 
+                      ? 'bg-yellow-500/20 text-yellow-400' 
+                      : 'bg-green-500/20 text-green-400'
+                  }`}>
+                    {turnState.status === 'pending_confirmation' ? 'Waiting' : 'Ready'}
+                  </span>
+                  <CountdownTimer deadline={turnState.deadline} isActive={isCurrentTurn} />
+                </div>
+              )}
             </div>
-            {isMyTurn(color) && (
-              <p className="text-xs text-chess-accent mt-1 ml-4">Your turn to move!</p>
-            )}
-          </div>
-        ) : (
-          <div className="p-3 rounded-lg mb-2 bg-white/5 border border-dashed border-white/10">
-            <span className="text-sm text-gray-500 italic">Waiting for player...</span>
-          </div>
-        )}
+          ) : (
+            <div className="p-2 rounded-lg bg-white/5 text-gray-500 text-sm italic">
+              No player
+            </div>
+          )}
+        </div>
 
         {/* Queue */}
-        {players.length > 0 && (
-          <div className="space-y-1">
-            <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">
-              Queue ({players.length})
-            </p>
-            {players.slice(0, 5).map((player, index) => (
-              <div
-                key={player.id}
-                className={`px-2 py-1.5 rounded text-xs ${
-                  player.id === currentPlayerId 
-                    ? 'bg-yellow-400/10 text-yellow-400' 
-                    : 'bg-white/5 text-gray-400'
-                }`}
-              >
-                <span className="text-gray-600 mr-2">#{index + 1}</span>
-                {player.name}
-                {player.id === currentPlayerId && ' (You)'}
-              </div>
-            ))}
-            {players.length > 5 && (
-              <p className="text-[10px] text-gray-500 pl-2">
-                +{players.length - 5} more waiting
-              </p>
-            )}
-          </div>
-        )}
+        <div>
+          <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">
+            Queue ({queue.length})
+          </p>
+          {queue.length > 0 ? (
+            <div className="space-y-1 max-h-32 overflow-y-auto">
+              {queue.map((player, index) => (
+                <div
+                  key={player.id}
+                  className={`flex items-center justify-between p-2 rounded-lg text-sm ${
+                    player.id === currentPlayerId ? 'bg-chess-accent/10 text-chess-accent' : 'bg-white/5 text-gray-400'
+                  }`}
+                >
+                  <span>
+                    {index + 1}. {player.name}
+                    {player.id === currentPlayerId && ' (You)'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-gray-500 text-sm italic p-2">Empty</p>
+          )}
+        </div>
+
+        {/* Join/Leave button */}
+        <div className="mt-3">
+          {playerColor === color ? (
+            <button
+              onClick={onLeaveQueue}
+              className="w-full py-2 px-3 bg-red-500/20 hover:bg-red-500/30 text-red-400 text-sm font-medium rounded-lg transition-all"
+            >
+              Leave Queue
+            </button>
+          ) : !isInQueue ? (
+            <button
+              onClick={() => onJoinQueue(color)}
+              className="w-full py-2 px-3 bg-chess-accent/20 hover:bg-chess-accent/30 text-chess-accent text-sm font-medium rounded-lg transition-all"
+            >
+              Join as {colorLabel}
+            </button>
+          ) : null}
+        </div>
       </div>
     )
   }
 
   return (
-    <div className="card p-5 w-full max-w-md">
-      <h2 className="font-serif text-xl mb-4 text-center">Player Queue</h2>
-      
-      <div className="flex divide-x divide-white/10">
-        {renderPlayerList(whiteQueue, currentWhitePlayer, 'w')}
-        {renderPlayerList(blackQueue, currentBlackPlayer, 'b')}
-      </div>
-
-      {/* Join/Leave buttons */}
-      <div className="mt-5 pt-4 border-t border-white/10">
-        {isInQueue ? (
-          <button
-            onClick={onLeaveQueue}
-            className="w-full py-3 px-4 rounded-xl bg-red-500/20 hover:bg-red-500/30 text-red-400 font-medium transition-all"
-          >
-            Leave Queue
-          </button>
-        ) : (
-          <div className="grid grid-cols-2 gap-3">
-            <button
-              onClick={() => onJoinQueue('w')}
-              className="py-3 px-4 rounded-xl bg-white/10 hover:bg-white/20 text-white font-medium transition-all flex items-center justify-center gap-2"
-            >
-              <span className="w-3 h-3 rounded-full bg-white" />
-              Play White
-            </button>
-            <button
-              onClick={() => onJoinQueue('b')}
-              className="py-3 px-4 rounded-xl bg-white/10 hover:bg-white/20 text-white font-medium transition-all flex items-center justify-center gap-2"
-            >
-              <span className="w-3 h-3 rounded-full bg-gray-900 ring-1 ring-white/30" />
-              Play Black
-            </button>
-          </div>
-        )}
-        
-        {playerColor && (
-          <p className="text-center text-sm text-gray-400 mt-3">
-            You&apos;re playing as {playerColor === 'w' ? 'White' : 'Black'}
-          </p>
-        )}
+    <div className="card p-4 w-full lg:w-72">
+      <h2 className="font-serif text-lg mb-4 text-center">Player Queue</h2>
+      <div className="space-y-4">
+        {renderQueue('w', whiteQueue, currentWhitePlayer, whiteTurnState)}
+        {renderQueue('b', blackQueue, currentBlackPlayer, blackTurnState)}
       </div>
     </div>
   )

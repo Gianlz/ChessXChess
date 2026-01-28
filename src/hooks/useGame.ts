@@ -2,11 +2,11 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { Square, Move } from 'chess.js'
-import { GameState, QueueState } from '@/lib/gameStore'
+import { GameState, QueueState, TurnState } from '@/lib/gameStore'
 import { useGameStream } from './useGameStream'
 import type { ConnectionStatus } from './useGameStream'
 
-export type { ConnectionStatus }
+export type { ConnectionStatus, TurnState }
 
 interface UseGameReturn {
   gameState: GameState | null
@@ -21,6 +21,10 @@ interface UseGameReturn {
   canPlay: boolean
   error: string | null
   connectionStatus: ConnectionStatus
+  turnState: TurnState | null
+  needsConfirmation: boolean
+  isConfirmed: boolean
+  timeRemaining: number
   setPlayerName: (name: string) => void
   joinQueue: (color: 'w' | 'b') => Promise<void>
   leaveQueue: () => Promise<void>
@@ -28,6 +32,7 @@ interface UseGameReturn {
   makeMove: (from: Square, to: Square, promotion?: string) => Promise<boolean>
   resetGame: () => Promise<void>
   reconnect: () => void
+  confirmReady: () => Promise<void>
 }
 
 export function useGame(): UseGameReturn {
@@ -40,6 +45,7 @@ export function useGame(): UseGameReturn {
   const [selectedSquare, setSelectedSquare] = useState<Square | null>(null)
   const [validMoves, setValidMoves] = useState<Square[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [timeRemaining, setTimeRemaining] = useState<number>(0)
 
   // Generate player ID on mount
   useEffect(() => {
@@ -92,7 +98,37 @@ export function useGame(): UseGameReturn {
     (gameState.turn === 'b' && queueState.currentBlackPlayer?.id === playerId)
   ) : false
 
-  const canPlay = isMyTurn && !gameState?.isGameOver
+  // Get the turn state for the current player
+  const turnState = gameState && queueState && isMyTurn ? (
+    gameState.turn === 'w' ? queueState.whiteTurnState : queueState.blackTurnState
+  ) : null
+
+  const needsConfirmation = isMyTurn && turnState?.status === 'pending_confirmation'
+  const isConfirmed = isMyTurn && turnState?.status === 'confirmed'
+
+  // Can only play if confirmed and not timed out
+  const canPlay = isConfirmed && !gameState?.isGameOver
+
+  // Calculate and update time remaining
+  useEffect(() => {
+    if (!turnState || !isMyTurn) {
+      setTimeRemaining(0)
+      return
+    }
+
+    const updateTimer = () => {
+      const remaining = Math.max(0, Math.ceil((turnState.deadline - Date.now()) / 1000))
+      setTimeRemaining(remaining)
+    }
+
+    // Update immediately
+    updateTimer()
+
+    // Update every 100ms for smooth countdown
+    const interval = setInterval(updateTimer, 100)
+
+    return () => clearInterval(interval)
+  }, [turnState, isMyTurn])
 
   const updatePlayerName = useCallback((name: string) => {
     setPlayerName(name)
@@ -239,6 +275,28 @@ export function useGame(): UseGameReturn {
     }
   }, [])
 
+  const confirmReady = useCallback(async () => {
+    if (!playerId) return
+
+    try {
+      const response = await fetch('/api/game', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'confirmReady',
+          playerId,
+        }),
+      })
+      const data = await response.json()
+      if (!data.success) {
+        setError(data.error || 'Failed to confirm')
+      }
+      // No need to refresh - stream will update automatically
+    } catch {
+      setError('Failed to confirm ready')
+    }
+  }, [playerId])
+
   // Clear error after timeout
   useEffect(() => {
     if (error) {
@@ -260,6 +318,10 @@ export function useGame(): UseGameReturn {
     canPlay,
     error,
     connectionStatus,
+    turnState,
+    needsConfirmation,
+    isConfirmed,
+    timeRemaining,
     setPlayerName: updatePlayerName,
     joinQueue,
     leaveQueue,
@@ -267,5 +329,6 @@ export function useGame(): UseGameReturn {
     makeMove,
     resetGame,
     reconnect,
+    confirmReady,
   }
 }

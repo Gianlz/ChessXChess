@@ -214,6 +214,15 @@ export async function POST(request: NextRequest) {
       return secureJsonResponse({ moves }, 200, headers)
     }
 
+    case 'confirmReady': {
+      const playerId = validatePlayerId(body.playerId)
+      if (!playerId) {
+        return secureJsonResponse({ error: 'Invalid player ID' }, 400, headers)
+      }
+      const result = await gameStore.confirmReady(playerId)
+      return secureJsonResponse(result, result.success ? 200 : 400, headers)
+    }
+
     default:
       return secureJsonResponse({ error: 'Unknown action' }, 400, headers)
   }

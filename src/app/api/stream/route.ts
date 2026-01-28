@@ -67,6 +67,9 @@ export async function GET(request: NextRequest) {
           if (!isActive) return
 
           try {
+            // Check and expire any timed-out turns
+            await gameStore.checkAndExpireTurns()
+            
             const currentVersion = await gameStore.getVersion()
 
             if (currentVersion !== lastVersion) {

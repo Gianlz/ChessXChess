@@ -1,7 +1,9 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { GameState, QueueState } from '@/lib/gameStore'
+import { GameState, QueueState, TurnState } from '@/lib/gameStore'
+
+export type { TurnState }
 
 export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
 

@@ -46,5 +46,7 @@ export const REDIS_KEYS = {
   BLACK_QUEUE: 'chess:queue:black',
   CURRENT_WHITE: 'chess:current:white',
   CURRENT_BLACK: 'chess:current:black',
+  TURN_WHITE: 'chess:turn:white',
+  TURN_BLACK: 'chess:turn:black',
   VERSION: 'chess:version',
 } as const

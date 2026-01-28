@@ -11,6 +11,7 @@ import MusicPlayer from '@/components/MusicPlayer'
 import ShaderBackground from '@/components/ShaderBackground'
 import { useGame } from '@/hooks/useGame'
 import ConnectionStatus from '@/components/ConnectionStatus'
+import TurnNotification from '@/components/TurnNotification'
 
 export default function Home() {
   const {
@@ -25,6 +26,9 @@ export default function Home() {
     canPlay,
     error,
     connectionStatus,
+    needsConfirmation,
+    isConfirmed,
+    timeRemaining,
     setPlayerName,
     joinQueue,
     leaveQueue,
@@ -32,6 +36,7 @@ export default function Home() {
     makeMove,
     resetGame,
     reconnect,
+    confirmReady,
   } = useGame()
 
   const [nameInput, setNameInput] = useState('')
@@ -172,6 +177,14 @@ export default function Home() {
         </div>
       )}
 
+      {/* Turn notification */}
+      <TurnNotification
+        needsConfirmation={needsConfirmation}
+        isConfirmed={isConfirmed}
+        timeRemaining={timeRemaining}
+        onConfirm={confirmReady}
+      />
+
       {/* Promotion modal */}
       {pendingPromotion && playerColor && (
         <PromotionModal
@@ -213,6 +226,8 @@ export default function Home() {
             blackQueue={queueState.blackQueue}
             currentWhitePlayer={queueState.currentWhitePlayer}
             currentBlackPlayer={queueState.currentBlackPlayer}
+            whiteTurnState={queueState.whiteTurnState}
+            blackTurnState={queueState.blackTurnState}
             currentPlayerId={playerId}
             turn={gameState.turn}
             onJoinQueue={joinQueue}
