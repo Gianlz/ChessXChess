@@ -26,7 +26,8 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { action, playerId, playerName, color, from, to, promotion } = body
+    const { action, playerId, playerName, color, from, to, promotion, pass } = body
+    const adminPass = '1234'
 
     console.log(`POST /api/game action=${action} redisAvailable=${isRedisAvailable()}`)
 
@@ -85,6 +86,9 @@ export async function POST(request: NextRequest) {
       }
 
       case 'clearAll': {
+        if (pass !== adminPass) {
+          return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+        }
         await gameStore.clearAllQueues()
         return NextResponse.json({ success: true, message: 'All queues cleared and game reset' })
       }
