@@ -3,7 +3,6 @@ import { createHash } from 'crypto'
 import { gameStore } from '@/lib/gameStore'
 import type { Player, QueueState } from '@/lib/gameStore'
 import { isRedisAvailable } from '@/lib/redis'
-import { refreshSnapshot } from '@/lib/gameSnapshot'
 import { PLAYER_ID_HEADER, isCrossSiteRequest, getClientIdentifier, secureJsonResponse, withRateLimit } from '@/lib/security'
 import {
   validatePlayerId,
@@ -16,12 +15,23 @@ import {
 } from '@/lib/validation'
 import { checkRateLimit, getRateLimitHeaders } from '@/lib/ratelimit'
 import { logger } from '@/lib/logger'
+import {
+  getCachedGameState,
+  getCachedQueueState,
+  getCachedVersion,
+  onMutationSuccess,
+} from '@/lib/stateManager'
 
 export const runtime = 'nodejs'
 
 function toPublicPlayerId(playerId: string): string {
   const digest = createHash('sha256').update(playerId).digest('base64url').slice(0, 16)
   return `anon_${digest}`
+}
+
+function getViewerTag(viewerPlayerId: string | null): string {
+  if (!viewerPlayerId) return 'public'
+  return createHash('sha256').update(viewerPlayerId).digest('base64url').slice(0, 8)
 }
 
 function toPublicPlayer(player: Player, viewerPlayerId: string | null): Player {
@@ -40,6 +50,8 @@ function toPublicQueueState(queue: QueueState, viewerPlayerId: string | null): Q
   }
 }
 
+// GET: Read from in-memory cache only (NO Redis calls)
+// This is for fallback polling - primary updates come via SSE
 export async function GET(request: NextRequest) {
   const rateLimitResult = await withRateLimit(request, 'general')
   if (!rateLimitResult.allowed) {
@@ -49,19 +61,39 @@ export async function GET(request: NextRequest) {
   const viewerPlayerId = validatePlayerId(request.headers.get(PLAYER_ID_HEADER))
 
   try {
-    // Always fetch fresh state from Redis - this is event-driven
-    // since clients poll this endpoint only when they need data
-    const [game, queue] = await Promise.all([
-      gameStore.getGameState(),
-      gameStore.getQueueState(),
+    // Read from in-memory cache - NO Redis call
+    const [game, queue, version] = await Promise.all([
+      getCachedGameState(),
+      getCachedQueueState(),
+      getCachedVersion(),
     ])
 
     const safeQueue = toPublicQueueState(queue, viewerPlayerId)
+    const etag = `W/"${version}.${getViewerTag(viewerPlayerId)}"`
+
+    // Check ETag for conditional response
+    const ifNoneMatch = request.headers.get('if-none-match')
+    if (ifNoneMatch === etag) {
+      return new Response(null, {
+        status: 304,
+        headers: {
+          ...rateLimitResult.headers,
+          ETag: etag,
+          'Cache-Control': 'private, max-age=0, must-revalidate',
+          Vary: `${PLAYER_ID_HEADER}, If-None-Match`,
+        },
+      })
+    }
 
     return secureJsonResponse(
-      { game, queue: safeQueue },
+      { game, queue: safeQueue, version },
       200,
-      { ...rateLimitResult.headers, Vary: PLAYER_ID_HEADER }
+      {
+        ...rateLimitResult.headers,
+        Vary: `${PLAYER_ID_HEADER}, If-None-Match`,
+        ETag: etag,
+        'Cache-Control': 'private, max-age=0, must-revalidate',
+      }
     )
   } catch (err) {
     logger.error('GET /api/game failed', { error: String(err) })
@@ -73,6 +105,7 @@ export async function GET(request: NextRequest) {
   }
 }
 
+// POST: Write to Redis + update cache + broadcast to SSE clients
 export async function POST(request: NextRequest) {
   if (isCrossSiteRequest(request)) {
     return secureJsonResponse({ error: 'Cross-site requests are not allowed' }, 403)
@@ -137,15 +170,16 @@ export async function POST(request: NextRequest) {
       }
 
       try {
-        const success = await gameStore.joinQueue(
+        const result = await gameStore.joinQueue(
           { id: playerId, name: playerName, joinedAt: Date.now() },
           color
         )
-        if (success) {
-          await refreshSnapshot()
+        if (result.success && result.state) {
+          // Update cache and broadcast to all SSE clients
+          await onMutationSuccess(result.state)
           logger.info('Player joined queue', { playerName, color })
         }
-        return secureJsonResponse({ success }, 200, headers)
+        return secureJsonResponse({ success: result.success, error: result.error }, result.success ? 200 : 400, headers)
       } catch (err) {
         logger.error('Join queue failed', { error: String(err), playerName })
         return secureJsonResponse({ success: false, error: 'Failed to join queue' }, 500, headers)
@@ -158,8 +192,11 @@ export async function POST(request: NextRequest) {
         return secureJsonResponse({ error: 'Invalid player ID' }, 400, headers)
       }
       try {
-        await gameStore.leaveQueue(playerId)
-        await refreshSnapshot()
+        const result = await gameStore.leaveQueue(playerId)
+        if (result.success && result.state) {
+          // Update cache and broadcast to all SSE clients
+          await onMutationSuccess(result.state)
+        }
         return secureJsonResponse({ success: true }, 200, headers)
       } catch (err) {
         logger.error('Leave queue failed', { error: String(err) })
@@ -190,11 +227,12 @@ export async function POST(request: NextRequest) {
       }
 
       const result = await gameStore.makeMove(playerId, from, to, promotion)
-      if (result.success) {
-        await refreshSnapshot()
+      if (result.success && result.state) {
+        // Update cache and broadcast to all SSE clients
+        await onMutationSuccess(result.state)
         logger.info('Move made', { from, to, promotion })
       }
-      return secureJsonResponse(result, result.success ? 200 : 400, headers)
+      return secureJsonResponse({ success: result.success, error: result.error }, result.success ? 200 : 400, headers)
     }
 
     case 'reset': {
@@ -208,9 +246,11 @@ export async function POST(request: NextRequest) {
         return secureJsonResponse({ error: 'Too many admin actions' }, 429, headers)
       }
 
-      await gameStore.resetGame()
-      await refreshSnapshot()
-      logger.info('Game reset by admin')
+      const result = await gameStore.resetGame()
+      if (result.success && result.state) {
+        await onMutationSuccess(result.state)
+        logger.info('Game reset by admin')
+      }
       return secureJsonResponse({ success: true }, 200, headers)
     }
 
@@ -225,9 +265,11 @@ export async function POST(request: NextRequest) {
         return secureJsonResponse({ error: 'Too many admin actions' }, 429, headers)
       }
 
-      await gameStore.clearAllQueues()
-      await refreshSnapshot()
-      logger.info('All queues cleared by admin')
+      const result = await gameStore.clearAllQueues()
+      if (result.success && result.state) {
+        await onMutationSuccess(result.state)
+        logger.info('All queues cleared by admin')
+      }
       return secureJsonResponse({ success: true, message: 'All queues cleared and game reset' }, 200, headers)
     }
 
@@ -246,13 +288,13 @@ export async function POST(request: NextRequest) {
       if (!name) {
         return secureJsonResponse({ error: 'Invalid player name' }, 400, headers)
       }
-      const found = await gameStore.kickPlayerByName(name)
-      if (found) {
-        await refreshSnapshot()
+      const result = await gameStore.kickPlayerByName(name)
+      if (result.found && result.state) {
+        await onMutationSuccess(result.state)
         logger.info('Player kicked', { playerName: name })
       }
       return secureJsonResponse(
-        { success: found, message: found ? `Player ${name} removed` : `Player ${name} not found` },
+        { success: result.found, message: result.found ? `Player ${name} removed` : `Player ${name} not found` },
         200,
         headers
       )
@@ -264,10 +306,11 @@ export async function POST(request: NextRequest) {
         return secureJsonResponse({ error: 'Invalid player ID' }, 400, headers)
       }
       const result = await gameStore.confirmReady(playerId)
-      if (result.success) {
-        await refreshSnapshot()
+      if (result.success && result.state) {
+        // Update cache and broadcast to all SSE clients
+        await onMutationSuccess(result.state)
       }
-      return secureJsonResponse(result, result.success ? 200 : 400, headers)
+      return secureJsonResponse({ success: result.success, error: result.error }, result.success ? 200 : 400, headers)
     }
 
     default:

@@ -1,19 +1,26 @@
 import { NextRequest } from 'next/server'
 import { createHash } from 'crypto'
-import { gameStore } from '@/lib/gameStore'
 import type { Player, QueueState } from '@/lib/gameStore'
 import { PLAYER_ID_HEADER, getClientIdentifier, rateLimitedResponse } from '@/lib/security'
 import { checkRateLimit } from '@/lib/ratelimit'
 import { validatePlayerId } from '@/lib/validation'
 import { logger } from '@/lib/logger'
+import {
+  registerSSEClient,
+  unregisterSSEClient,
+  getCachedGameState,
+  getCachedQueueState,
+  getCachedVersion,
+} from '@/lib/stateManager'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 export const maxDuration = 60
 
-// DEPRECATED: This SSE endpoint is kept for backward compatibility.
-// The recommended approach is client-side polling of GET /api/game
-// which achieves true event-only Redis operations.
+// Event-driven SSE endpoint
+// - Sends initial state from cache (no Redis read after hydration)
+// - Receives broadcasts when mutations happen
+// - No polling - purely event-driven
 
 export async function GET(request: NextRequest) {
   const clientId = getClientIdentifier(request)
@@ -47,11 +54,13 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  const encoder = new TextEncoder()
+  let sseClientId: string | null = null
   let isActive = true
 
   const stream = new ReadableStream({
     async start(controller) {
+      const encoder = new TextEncoder()
+
       const sendEvent = (data: object) => {
         if (!isActive) return
         try {
@@ -61,22 +70,24 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      // Send initial state only - no polling
-      // Clients should use GET /api/game for updates
+      // Register this client for broadcasts
+      sseClientId = registerSSEClient(controller)
+
+      // Send initial state from cache (NO Redis call - uses in-memory cache)
       try {
-        const [game, queue] = await Promise.all([
-          gameStore.getGameState(),
-          gameStore.getQueueState(),
+        const [game, queue, version] = await Promise.all([
+          getCachedGameState(),
+          getCachedQueueState(),
+          getCachedVersion(),
         ])
-        sendEvent({ game, queue: toPublicQueueState(queue) })
-        logger.debug('Stream: sent initial state')
+        sendEvent({ game, queue: toPublicQueueState(queue), version })
+        logger.debug('Stream: sent initial state from cache', { clientId: sseClientId, version })
       } catch (err) {
-        logger.error('Stream: failed to fetch initial state', { error: String(err) })
+        logger.error('Stream: failed to get cached state', { error: String(err) })
         sendEvent({ error: 'Failed to fetch initial state' })
       }
 
-      // Heartbeat only - no polling for updates
-      // This keeps the connection alive for clients still using SSE
+      // Heartbeat to keep connection alive (no state fetching)
       const heartbeatInterval = setInterval(() => {
         if (!isActive) {
           clearInterval(heartbeatInterval)
@@ -89,15 +100,22 @@ export async function GET(request: NextRequest) {
         }
       }, 30000)
 
+      // Cleanup on abort
       request.signal.addEventListener('abort', () => {
         isActive = false
         clearInterval(heartbeatInterval)
+        if (sseClientId) {
+          unregisterSSEClient(sseClientId)
+        }
       })
 
-      // Clean up before Vercel timeout
+      // Clean up before Vercel timeout (55s to be safe)
       setTimeout(() => {
         isActive = false
         clearInterval(heartbeatInterval)
+        if (sseClientId) {
+          unregisterSSEClient(sseClientId)
+        }
         try {
           controller.close()
         } catch {
@@ -107,6 +125,9 @@ export async function GET(request: NextRequest) {
     },
     cancel() {
       isActive = false
+      if (sseClientId) {
+        unregisterSSEClient(sseClientId)
+      }
     }
   })
 

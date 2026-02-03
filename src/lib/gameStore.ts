@@ -264,13 +264,13 @@ class InMemoryStore {
     return this.state.version
   }
 
-  joinQueue(player: Player, color: 'w' | 'b'): boolean {
+  joinQueue(player: Player, color: 'w' | 'b'): { success: boolean; state?: ConsolidatedState; error?: string } {
     const state = this.getState()
     const queue = color === 'w' ? state.queues.white : state.queues.black
     const currentPlayer = color === 'w' ? state.current.white : state.current.black
 
-    if (queue.some(p => p.id === player.id)) return false
-    if (currentPlayer?.id === player.id) return false
+    if (queue.some(p => p.id === player.id)) return { success: false, error: 'Already in queue' }
+    if (currentPlayer?.id === player.id) return { success: false, error: 'Already playing' }
 
     queue.push(player)
 
@@ -279,10 +279,10 @@ class InMemoryStore {
     }
 
     state.version++
-    return true
+    return { success: true, state }
   }
 
-  leaveQueue(playerId: string): void {
+  leaveQueue(playerId: string): { success: boolean; state?: ConsolidatedState } {
     const state = this.getState()
 
     state.queues.white = state.queues.white.filter(p => p.id !== playerId)
@@ -300,9 +300,10 @@ class InMemoryStore {
     }
 
     state.version++
+    return { success: true, state }
   }
 
-  confirmReady(playerId: string): { success: boolean; error?: string } {
+  confirmReady(playerId: string): { success: boolean; state?: ConsolidatedState; error?: string } {
     const state = this.getState()
     const turn = getTurnFromFen(state.game.fen)
     const currentPlayer = turn === 'w' ? state.current.white : state.current.black
@@ -332,10 +333,10 @@ class InMemoryStore {
     }
 
     state.version++
-    return { success: true }
+    return { success: true, state }
   }
 
-  makeMove(playerId: string, from: Square, to: Square, promotion?: string): { success: boolean; error?: string } {
+  makeMove(playerId: string, from: Square, to: Square, promotion?: string): { success: boolean; state?: ConsolidatedState; error?: string } {
     const state = this.getState()
     const chess = new Chess()
     try {
@@ -386,7 +387,7 @@ class InMemoryStore {
         initializeTurnStateIfNeeded(state)
 
         state.version++
-        return { success: true }
+        return { success: true, state }
       }
       return { success: false, error: 'Invalid move' }
     } catch {
@@ -394,7 +395,7 @@ class InMemoryStore {
     }
   }
 
-  resetGame(): void {
+  resetGame(): { success: boolean; state?: ConsolidatedState } {
     const state = this.state
     state.game = {
       fen: new Chess().fen(),
@@ -402,13 +403,15 @@ class InMemoryStore {
       moveHistory: [],
     }
     state.version++
+    return { success: true, state }
   }
 
-  clearAllQueues(): void {
+  clearAllQueues(): { success: boolean; state?: ConsolidatedState } {
     this.state = createDefaultState()
+    return { success: true, state: this.state }
   }
 
-  kickPlayerByName(playerName: string): boolean {
+  kickPlayerByName(playerName: string): { found: boolean; state?: ConsolidatedState } {
     const state = this.getState()
     let found = false
 
@@ -435,7 +438,7 @@ class InMemoryStore {
     }
 
     if (found) state.version++
-    return found
+    return { found, state }
   }
 }
 
@@ -539,7 +542,7 @@ class RedisStore {
     return deriveQueueState(state)
   }
 
-  async joinQueue(player: Player, color: 'w' | 'b'): Promise<boolean> {
+  async joinQueue(player: Player, color: 'w' | 'b'): Promise<{ success: boolean; state?: ConsolidatedState; error?: string }> {
     const result = await this.updateState((state) => {
       const queue = color === 'w' ? state.queues.white : state.queues.black
       const currentPlayer = color === 'w' ? state.current.white : state.current.black
@@ -561,11 +564,11 @@ class RedisStore {
       return { success: true }
     })
 
-    return result.success
+    return { success: result.success, state: result.state, error: result.error }
   }
 
-  async leaveQueue(playerId: string): Promise<void> {
-    await this.updateState((state) => {
+  async leaveQueue(playerId: string): Promise<{ success: boolean; state?: ConsolidatedState }> {
+    const result = await this.updateState((state) => {
       state.queues.white = state.queues.white.filter(p => p.id !== playerId)
       state.queues.black = state.queues.black.filter(p => p.id !== playerId)
 
@@ -582,9 +585,10 @@ class RedisStore {
 
       return { success: true }
     })
+    return { success: result.success, state: result.state }
   }
 
-  async confirmReady(playerId: string): Promise<{ success: boolean; error?: string }> {
+  async confirmReady(playerId: string): Promise<{ success: boolean; state?: ConsolidatedState; error?: string }> {
     const result = await this.updateState((state) => {
       const turn = getTurnFromFen(state.game.fen)
       const currentPlayer = turn === 'w' ? state.current.white : state.current.black
@@ -616,10 +620,10 @@ class RedisStore {
       return { success: true }
     })
 
-    return { success: result.success, error: result.error }
+    return { success: result.success, state: result.state, error: result.error }
   }
 
-  async makeMove(playerId: string, from: Square, to: Square, promotion?: string): Promise<{ success: boolean; error?: string }> {
+  async makeMove(playerId: string, from: Square, to: Square, promotion?: string): Promise<{ success: boolean; state?: ConsolidatedState; error?: string }> {
     const result = await this.updateState((state) => {
       const chess = new Chess()
       try {
@@ -678,11 +682,11 @@ class RedisStore {
       }
     })
 
-    return { success: result.success, error: result.error }
+    return { success: result.success, state: result.state, error: result.error }
   }
 
-  async resetGame(): Promise<void> {
-    await this.updateState((state) => {
+  async resetGame(): Promise<{ success: boolean; state?: ConsolidatedState }> {
+    const result = await this.updateState((state) => {
       state.game = {
         fen: new Chess().fen(),
         lastMove: null,
@@ -690,23 +694,27 @@ class RedisStore {
       }
       return { success: true }
     })
+    return { success: result.success, state: result.state }
   }
 
-  async clearAllQueues(): Promise<void> {
+  async clearAllQueues(): Promise<{ success: boolean; state?: ConsolidatedState }> {
     const redis = getRedis()
-    if (!redis) return
+    if (!redis) return { success: false }
 
     try {
-      await redis.set(REDIS_KEY, createDefaultState())
+      const newState = createDefaultState()
+      await redis.set(REDIS_KEY, newState)
+      return { success: true, state: newState }
     } catch (err) {
       logger.error('Redis: Failed to clear all', { error: String(err) })
+      return { success: false }
     }
   }
 
-  async kickPlayerByName(playerName: string): Promise<boolean> {
+  async kickPlayerByName(playerName: string): Promise<{ found: boolean; state?: ConsolidatedState }> {
     let found = false
 
-    await this.updateState((state) => {
+    const result = await this.updateState((state) => {
       const whiteLen = state.queues.white.length
       state.queues.white = state.queues.white.filter(p => p.name !== playerName)
       if (state.queues.white.length !== whiteLen) found = true
@@ -732,7 +740,7 @@ class RedisStore {
       return { success: true }
     })
 
-    return found
+    return { found, state: result.state }
   }
 }
 
@@ -762,49 +770,49 @@ export const gameStore = {
     return inMemoryStore.getVersion()
   },
 
-  async joinQueue(player: Player, color: 'w' | 'b'): Promise<boolean> {
+  async joinQueue(player: Player, color: 'w' | 'b'): Promise<{ success: boolean; state?: ConsolidatedState; error?: string }> {
     if (isRedisAvailable()) {
       return await redisStore.joinQueue(player, color)
     }
     return inMemoryStore.joinQueue(player, color)
   },
 
-  async leaveQueue(playerId: string): Promise<void> {
+  async leaveQueue(playerId: string): Promise<{ success: boolean; state?: ConsolidatedState }> {
     if (isRedisAvailable()) {
       return await redisStore.leaveQueue(playerId)
     }
     return inMemoryStore.leaveQueue(playerId)
   },
 
-  async makeMove(playerId: string, from: Square, to: Square, promotion?: string): Promise<{ success: boolean; error?: string }> {
+  async makeMove(playerId: string, from: Square, to: Square, promotion?: string): Promise<{ success: boolean; state?: ConsolidatedState; error?: string }> {
     if (isRedisAvailable()) {
       return await redisStore.makeMove(playerId, from, to, promotion)
     }
     return inMemoryStore.makeMove(playerId, from, to, promotion)
   },
 
-  async resetGame(): Promise<void> {
+  async resetGame(): Promise<{ success: boolean; state?: ConsolidatedState }> {
     if (isRedisAvailable()) {
       return await redisStore.resetGame()
     }
     return inMemoryStore.resetGame()
   },
 
-  async clearAllQueues(): Promise<void> {
+  async clearAllQueues(): Promise<{ success: boolean; state?: ConsolidatedState }> {
     if (isRedisAvailable()) {
       return await redisStore.clearAllQueues()
     }
     return inMemoryStore.clearAllQueues()
   },
 
-  async kickPlayerByName(playerName: string): Promise<boolean> {
+  async kickPlayerByName(playerName: string): Promise<{ found: boolean; state?: ConsolidatedState }> {
     if (isRedisAvailable()) {
       return await redisStore.kickPlayerByName(playerName)
     }
     return inMemoryStore.kickPlayerByName(playerName)
   },
 
-  async confirmReady(playerId: string): Promise<{ success: boolean; error?: string }> {
+  async confirmReady(playerId: string): Promise<{ success: boolean; state?: ConsolidatedState; error?: string }> {
     if (isRedisAvailable()) {
       return await redisStore.confirmReady(playerId)
     }
