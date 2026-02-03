@@ -1,5 +1,10 @@
 import { NextRequest } from 'next/server'
+import { createHash } from 'crypto'
 import { gameStore } from '@/lib/gameStore'
+import type { Player, QueueState } from '@/lib/gameStore'
+import { PLAYER_ID_HEADER, getClientIdentifier, rateLimitedResponse } from '@/lib/security'
+import { checkRateLimit } from '@/lib/ratelimit'
+import { validatePlayerId } from '@/lib/validation'
 import { logger } from '@/lib/logger'
 
 export const dynamic = 'force-dynamic'
@@ -11,6 +16,37 @@ export const maxDuration = 60
 // which achieves true event-only Redis operations.
 
 export async function GET(request: NextRequest) {
+  const clientId = getClientIdentifier(request)
+  const rateLimitResult = await checkRateLimit(clientId, 'general')
+
+  if (!rateLimitResult.success) {
+    logger.warn('Stream rate limited', { clientId })
+    return rateLimitedResponse(rateLimitResult, clientId)
+  }
+
+  const viewerPlayerId = validatePlayerId(request.headers.get(PLAYER_ID_HEADER))
+
+  const toPublicPlayerId = (playerId: string): string => {
+    const digest = createHash('sha256').update(playerId).digest('base64url').slice(0, 16)
+    return `anon_${digest}`
+  }
+
+  const toPublicPlayer = (player: Player): Player => {
+    if (viewerPlayerId && player.id === viewerPlayerId) return { ...player }
+    return { ...player, id: toPublicPlayerId(player.id) }
+  }
+
+  const toPublicQueueState = (queue: QueueState): QueueState => {
+    return {
+      whiteQueue: queue.whiteQueue.map(toPublicPlayer),
+      blackQueue: queue.blackQueue.map(toPublicPlayer),
+      currentWhitePlayer: queue.currentWhitePlayer ? toPublicPlayer(queue.currentWhitePlayer) : null,
+      currentBlackPlayer: queue.currentBlackPlayer ? toPublicPlayer(queue.currentBlackPlayer) : null,
+      whiteTurnState: queue.whiteTurnState,
+      blackTurnState: queue.blackTurnState,
+    }
+  }
+
   const encoder = new TextEncoder()
   let isActive = true
 
@@ -32,7 +68,7 @@ export async function GET(request: NextRequest) {
           gameStore.getGameState(),
           gameStore.getQueueState(),
         ])
-        sendEvent({ game, queue })
+        sendEvent({ game, queue: toPublicQueueState(queue) })
         logger.debug('Stream: sent initial state')
       } catch (err) {
         logger.error('Stream: failed to fetch initial state', { error: String(err) })

@@ -1,3 +1,5 @@
+import 'server-only'
+
 import type { GameState, QueueState } from '@/lib/gameStore'
 import { gameStore } from '@/lib/gameStore'
 

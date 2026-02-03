@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { Player, TurnState } from '@/lib/gameStore'
+import type { Player, TurnState } from '@/lib/gameStore'
 
 interface QueuePanelProps {
   whiteQueue: Player[]

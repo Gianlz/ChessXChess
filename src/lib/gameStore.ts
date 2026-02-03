@@ -1,3 +1,5 @@
+import 'server-only'
+
 import { Chess, Square } from 'chess.js'
 import { getRedis, isRedisAvailable, REDIS_KEY } from './redis'
 import { logger } from './logger'

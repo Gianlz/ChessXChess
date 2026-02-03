@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Chess, Square, Move } from 'chess.js'
-import { GameState, QueueState, TurnState } from '@/lib/gameStore'
+import type { GameState, QueueState, TurnState } from '@/lib/gameStore'
 import { useGameStream } from './useGameStream'
 import type { ConnectionStatus } from './useGameStream'
 
@@ -67,7 +67,10 @@ export function useGame(): UseGameReturn {
     if (storedId) {
       setPlayerId(storedId)
     } else {
-      const newId = `player_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      const bytes = new Uint8Array(16)
+      crypto.getRandomValues(bytes)
+      const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+      const newId = `player_${hex}`
       localStorage.setItem('chessPlayerId', newId)
       setPlayerId(newId)
     }

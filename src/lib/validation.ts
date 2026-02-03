@@ -37,14 +37,19 @@ export function sanitizePlayerName(name: unknown): string | null {
 export function validatePlayerId(id: unknown): string | null {
   if (typeof id !== 'string') return null
   
+  const trimmed = id.trim()
+
   // Must be reasonable length
-  if (id.length < 10 || id.length > 60) return null
+  if (trimmed.length < 15 || trimmed.length > 100) return null
   
-  // Must match expected format: player_{timestamp}_{random}
-  const playerIdPattern = /^player_\d+_[a-z0-9]+$/
-  if (!playerIdPattern.test(id)) return null
+  // Supported formats:
+  // - Legacy: player_{timestamp}_{random}
+  // - Secure: player_{32-hex}
+  const legacyPattern = /^player_\d+_[a-z0-9]+$/
+  const securePattern = /^player_[a-f0-9]{32}$/
+  if (!legacyPattern.test(trimmed) && !securePattern.test(trimmed)) return null
   
-  return id
+  return trimmed
 }
 
 // Validate chess square
@@ -100,4 +105,3 @@ export function validateAction(action: unknown): string | null {
   if (!VALID_ACTIONS.has(action)) return null
   return action
 }
-

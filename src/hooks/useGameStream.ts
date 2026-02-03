@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { GameState, QueueState, TurnState } from '@/lib/gameStore'
+import type { GameState, QueueState, TurnState } from '@/lib/gameStore'
 
 export type { TurnState }
 
@@ -19,6 +19,26 @@ interface UseGameStreamReturn {
   connectionStatus: ConnectionStatus
   reconnect: () => void
   refresh: () => Promise<void>
+}
+
+const PLAYER_ID_STORAGE_KEY = 'chessPlayerId'
+
+function generateSecurePlayerId(): string {
+  const bytes = new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+  return `player_${hex}`
+}
+
+function getOrCreatePlayerId(): string | null {
+  if (typeof window === 'undefined') return null
+
+  const storedId = localStorage.getItem(PLAYER_ID_STORAGE_KEY)
+  if (storedId) return storedId
+
+  const newId = generateSecurePlayerId()
+  localStorage.setItem(PLAYER_ID_STORAGE_KEY, newId)
+  return newId
 }
 
 // Polling interval when tab is visible (ms)
@@ -39,9 +59,14 @@ export function useGameStream(): UseGameStreamReturn {
   // Fetch game state from API
   const fetchState = useCallback(async (): Promise<boolean> => {
     try {
+      const playerId = getOrCreatePlayerId()
+
       const response = await fetch('/api/game', {
         method: 'GET',
-        headers: { 'Cache-Control': 'no-cache' },
+        headers: {
+          'Cache-Control': 'no-cache',
+          ...(playerId ? { 'X-Player-Id': playerId } : {}),
+        },
       })
 
       if (!response.ok) {
