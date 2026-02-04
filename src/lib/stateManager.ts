@@ -4,6 +4,7 @@ import type { GameState, QueueState, ConsolidatedState } from './gameStore'
 import { getRedis, isRedisAvailable, REDIS_KEY } from './redis'
 import { Chess } from 'chess.js'
 import { logger } from './logger'
+import { publishVersionUpdate, getPublishedVersion } from './pubsub'
 
 // ============================================================================
 // In-Memory State Cache
@@ -260,9 +261,30 @@ export async function onMutationSuccess(newState: ConsolidatedState): Promise<vo
   // Update local cache
   updateCache(newState)
 
-  // Notify all connected SSE clients that state has changed
+  // Publish version to Redis for cross-instance sync
+  // Other SSE instances will detect this change
+  await publishVersionUpdate(newState.version)
+
+  // Notify all connected SSE clients on THIS instance
   // They will fetch personalized data via GET /api/game
   broadcastVersionChange(newState.version)
+}
+
+/**
+ * Check if there's a newer version in Redis (from another instance)
+ * Used by SSE to detect cross-instance updates
+ */
+export async function checkCrossInstanceUpdate(localVersion: number): Promise<number | null> {
+  const publishedVersion = await getPublishedVersion()
+  if (publishedVersion !== null && publishedVersion > localVersion) {
+    // Another instance has a newer version - sync our cache
+    logger.debug('StateManager: Detected cross-instance update', { 
+      localVersion, 
+      publishedVersion 
+    })
+    return publishedVersion
+  }
+  return null
 }
 
 /**

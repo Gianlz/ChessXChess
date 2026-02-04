@@ -47,6 +47,8 @@ function getOrCreatePlayerId(): string | null {
 const SSE_RECONNECT_DELAY = 3000
 // Max reconnect attempts before giving up
 const MAX_RECONNECT_ATTEMPTS = 5
+// Fallback polling interval when SSE might be unreliable (ms)
+const FALLBACK_POLL_INTERVAL = 5000
 
 export function useGameStream(): UseGameStreamReturn {
   const [gameState, setGameState] = useState<GameState | null>(null)
@@ -55,9 +57,20 @@ export function useGameStream(): UseGameStreamReturn {
   
   const eventSourceRef = useRef<EventSource | null>(null)
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const reconnectAttemptsRef = useRef(0)
   const isVisibleRef = useRef(true)
   const mountedRef = useRef(true)
+  const lastVersionRef = useRef<number>(0)
+  const lastUpdateRef = useRef<number>(Date.now())
+
+  // Stop fallback polling
+  const stopFallbackPolling = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current)
+      pollIntervalRef.current = null
+    }
+  }, [])
 
   // Cleanup function
   const cleanup = useCallback(() => {
@@ -65,14 +78,15 @@ export function useGameStream(): UseGameStreamReturn {
       clearTimeout(reconnectTimeoutRef.current)
       reconnectTimeoutRef.current = null
     }
+    stopFallbackPolling()
     if (eventSourceRef.current) {
       eventSourceRef.current.close()
       eventSourceRef.current = null
     }
-  }, [])
+  }, [stopFallbackPolling])
 
   // Fetch personalized state from API (reads from cache, not Redis)
-  const fetchPersonalizedState = useCallback(async () => {
+  const fetchPersonalizedState = useCallback(async (skipVersionCheck = false) => {
     const playerId = getOrCreatePlayerId()
     
     try {
@@ -81,12 +95,22 @@ export function useGameStream(): UseGameStreamReturn {
         headers: {
           'Cache-Control': 'no-cache',
           ...(playerId ? { 'X-Player-Id': playerId } : {}),
+          // Send current version for conditional fetch
+          ...(!skipVersionCheck && lastVersionRef.current ? { 'If-None-Match': `W/"${lastVersionRef.current}"` } : {}),
         },
       })
 
+      // 304 Not Modified - no changes
+      if (response.status === 304) return
       if (!response.ok) return
 
       const data = await response.json()
+      
+      // Update version tracking
+      if (data.version) {
+        lastVersionRef.current = data.version
+      }
+      lastUpdateRef.current = Date.now()
       
       if (data.game) {
         setGameState(data.game)
@@ -99,6 +123,21 @@ export function useGameStream(): UseGameStreamReturn {
       console.error('Failed to fetch state:', err)
     }
   }, [])
+
+  // Start fallback polling (safety net for missed SSE updates)
+  const startFallbackPolling = useCallback(() => {
+    if (pollIntervalRef.current) return
+    
+    pollIntervalRef.current = setInterval(() => {
+      if (!mountedRef.current || !isVisibleRef.current) return
+      
+      // Only poll if we haven't received an update recently
+      const timeSinceLastUpdate = Date.now() - lastUpdateRef.current
+      if (timeSinceLastUpdate > FALLBACK_POLL_INTERVAL) {
+        fetchPersonalizedState()
+      }
+    }, FALLBACK_POLL_INTERVAL)
+  }, [fetchPersonalizedState])
 
   // Connect to SSE stream
   const connectSSE = useCallback(() => {
@@ -117,6 +156,8 @@ export function useGameStream(): UseGameStreamReturn {
       if (!mountedRef.current) return
       reconnectAttemptsRef.current = 0
       setConnectionStatus('connected')
+      // Start fallback polling as safety net
+      startFallbackPolling()
     }
 
     eventSource.onmessage = (event) => {
@@ -132,11 +173,17 @@ export function useGameStream(): UseGameStreamReturn {
         
         // Handle version change notification - fetch fresh personalized data
         if (data.type === 'update') {
-          fetchPersonalizedState()
+          lastUpdateRef.current = Date.now()
+          fetchPersonalizedState(true) // Skip version check, force fetch
           return
         }
         
         // Handle initial state (sent on connection)
+        if (data.version) {
+          lastVersionRef.current = data.version
+        }
+        lastUpdateRef.current = Date.now()
+        
         if (data.game) {
           setGameState(data.game)
         }
@@ -172,7 +219,7 @@ export function useGameStream(): UseGameStreamReturn {
         }, SSE_RECONNECT_DELAY)
       }
     }
-  }, [cleanup, fetchPersonalizedState])
+  }, [cleanup, fetchPersonalizedState, startFallbackPolling])
 
   // Manual reconnect function
   const reconnect = useCallback(() => {
@@ -191,11 +238,14 @@ export function useGameStream(): UseGameStreamReturn {
       isVisibleRef.current = document.visibilityState === 'visible'
       
       if (isVisibleRef.current) {
-        // Tab became visible - reconnect if needed
+        // Tab became visible - reconnect if needed and fetch fresh state
         if (!eventSourceRef.current || eventSourceRef.current.readyState === EventSource.CLOSED) {
           reconnectAttemptsRef.current = 0
           connectSSE()
         }
+        // Always fetch fresh state when tab becomes visible
+        fetchPersonalizedState(true)
+        startFallbackPolling()
       } else {
         // Tab hidden - close connection to save resources
         // SSE will reconnect when tab becomes visible again
@@ -206,7 +256,7 @@ export function useGameStream(): UseGameStreamReturn {
 
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
-  }, [cleanup, connectSSE])
+  }, [cleanup, connectSSE, fetchPersonalizedState, startFallbackPolling])
 
   // Initial connection + cleanup
   useEffect(() => {

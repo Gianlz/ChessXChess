@@ -1,6 +1,8 @@
 import { NextRequest } from 'next/server'
 import { createHash } from 'crypto'
 import { gameStore } from '@/lib/gameStore'
+import { getFastPass } from '@/lib/fastpass'
+import { awardWinPoints } from '@/lib/ranking'
 import type { Player, QueueState } from '@/lib/gameStore'
 import { isRedisAvailable } from '@/lib/redis'
 import { PLAYER_ID_HEADER, isCrossSiteRequest, getClientIdentifier, secureJsonResponse, withRateLimit } from '@/lib/security'
@@ -170,8 +172,18 @@ export async function POST(request: NextRequest) {
       }
 
       try {
+        // Check if player has active FastPass
+        const visitorId = body.visitorId as string | undefined
+        let fastPassTier: 'bronze' | 'silver' | 'gold' | undefined
+        if (visitorId) {
+          const fastPass = await getFastPass(visitorId)
+          if (fastPass) {
+            fastPassTier = fastPass.tier
+          }
+        }
+
         const result = await gameStore.joinQueue(
-          { id: playerId, name: playerName, joinedAt: Date.now() },
+          { id: playerId, name: playerName, joinedAt: Date.now(), visitorId, fastPassTier },
           color
         )
         if (result.success && result.state) {
@@ -228,6 +240,23 @@ export async function POST(request: NextRequest) {
 
       const result = await gameStore.makeMove(playerId, from, to, promotion)
       if (result.success && result.state) {
+        // Check if game ended and award ranking points to FastPass players
+        if (result.state.game.winnerColor) {
+          const winningColor = result.state.game.winnerColor
+          const winningQueue = winningColor === 'w' ? result.state.queues.white : result.state.queues.black
+          const currentWinner = winningColor === 'w' ? result.state.current.white : result.state.current.black
+          
+          // Award points to all FastPass players on winning side
+          const playersToReward = [...winningQueue]
+          if (currentWinner) playersToReward.push(currentWinner)
+          
+          for (const p of playersToReward) {
+            if (p.visitorId && p.fastPassTier) {
+              await awardWinPoints(p.visitorId, p.name, p.fastPassTier)
+            }
+          }
+        }
+        
         // Update cache and broadcast to all SSE clients
         await onMutationSuccess(result.state)
         logger.info('Move made', { from, to, promotion })

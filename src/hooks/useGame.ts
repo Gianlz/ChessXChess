@@ -2,11 +2,12 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Chess, Square, Move } from 'chess.js'
-import type { GameState, QueueState, TurnState } from '@/lib/gameStore'
+import type { GameState, QueueState, TurnState, Player } from '@/lib/gameStore'
 import { useGameStream } from './useGameStream'
 import type { ConnectionStatus } from './useGameStream'
 
 export type { ConnectionStatus, TurnState }
+export type { Player } from '@/lib/gameStore'
 
 interface UseGameReturn {
   gameState: GameState | null
@@ -25,6 +26,7 @@ interface UseGameReturn {
   needsConfirmation: boolean
   isConfirmed: boolean
   timeRemaining: number
+  isPending: boolean // True when an action is in progress
   setPlayerName: (name: string) => void
   joinQueue: (color: 'w' | 'b') => Promise<void>
   leaveQueue: () => Promise<void>
@@ -45,6 +47,13 @@ export function useGame(): UseGameReturn {
   const [validMoves, setValidMoves] = useState<Square[]>([])
   const [error, setError] = useState<string | null>(null)
   const [timeRemaining, setTimeRemaining] = useState<number>(0)
+  const [isPending, setIsPending] = useState<boolean>(false)
+  
+  // Optimistic state overlays
+  const [optimisticQueueState, setOptimisticQueueState] = useState<QueueState | null>(null)
+  
+  // Use optimistic state if available, otherwise use server state
+  const effectiveQueueState = optimisticQueueState || queueState
 
   // Memoized chess instance for client-side move validation
   const chess = useMemo(() => {
@@ -80,14 +89,21 @@ export function useGame(): UseGameReturn {
     }
   }, [])
 
-  // Update player color based on queue state
+  // Clear optimistic state when server state updates
   useEffect(() => {
-    if (!queueState || !playerId) return
+    if (queueState) {
+      setOptimisticQueueState(null)
+    }
+  }, [queueState])
 
-    const inWhite = queueState.currentWhitePlayer?.id === playerId ||
-                    queueState.whiteQueue.some(p => p.id === playerId)
-    const inBlack = queueState.currentBlackPlayer?.id === playerId ||
-                    queueState.blackQueue.some(p => p.id === playerId)
+  // Update player color based on effective queue state
+  useEffect(() => {
+    if (!effectiveQueueState || !playerId) return
+
+    const inWhite = effectiveQueueState.currentWhitePlayer?.id === playerId ||
+                    effectiveQueueState.whiteQueue.some(p => p.id === playerId)
+    const inBlack = effectiveQueueState.currentBlackPlayer?.id === playerId ||
+                    effectiveQueueState.blackQueue.some(p => p.id === playerId)
 
     if (inWhite) {
       setPlayerColor('w')
@@ -96,7 +112,7 @@ export function useGame(): UseGameReturn {
     } else {
       setPlayerColor(null)
     }
-  }, [queueState, playerId])
+  }, [effectiveQueueState, playerId])
 
   // Clear selection when turn changes (another player moved)
   useEffect(() => {
@@ -108,13 +124,13 @@ export function useGame(): UseGameReturn {
 
   const isInQueue = playerColor !== null
 
-  const isMyTurn = gameState && queueState && playerId ? (
-    (gameState.turn === 'w' && queueState.currentWhitePlayer?.id === playerId) ||
-    (gameState.turn === 'b' && queueState.currentBlackPlayer?.id === playerId)
+  const isMyTurn = gameState && effectiveQueueState && playerId ? (
+    (gameState.turn === 'w' && effectiveQueueState.currentWhitePlayer?.id === playerId) ||
+    (gameState.turn === 'b' && effectiveQueueState.currentBlackPlayer?.id === playerId)
   ) : false
 
-  const turnState = gameState && queueState && isMyTurn ? (
-    gameState.turn === 'w' ? queueState.whiteTurnState : queueState.blackTurnState
+  const turnState = gameState && effectiveQueueState && isMyTurn ? (
+    gameState.turn === 'w' ? effectiveQueueState.whiteTurnState : effectiveQueueState.blackTurnState
   ) : null
 
   const needsConfirmation = isMyTurn && turnState?.status === 'pending_confirmation'
@@ -151,6 +167,22 @@ export function useGame(): UseGameReturn {
       return
     }
 
+    // Get visitorId for FastPass
+    const visitorId = localStorage.getItem('chessVisitorId')
+
+    // Optimistic update - immediately show player in queue
+    if (queueState) {
+      const newPlayer = { id: playerId, name: playerName, joinedAt: Date.now() }
+      const optimistic: QueueState = {
+        ...queueState,
+        whiteQueue: color === 'w' ? [...queueState.whiteQueue, newPlayer] : queueState.whiteQueue,
+        blackQueue: color === 'b' ? [...queueState.blackQueue, newPlayer] : queueState.blackQueue,
+      }
+      setOptimisticQueueState(optimistic)
+    }
+    
+    setIsPending(true)
+
     try {
       const response = await fetch('/api/game', {
         method: 'POST',
@@ -160,21 +192,41 @@ export function useGame(): UseGameReturn {
           playerId,
           playerName,
           color,
+          visitorId,
         }),
       })
       const data = await response.json()
       if (!data.success) {
+        // Rollback optimistic update on error
+        setOptimisticQueueState(null)
         setError(data.error || 'Failed to join queue')
       } else {
-        await refresh() // Immediate update after join
+        await refresh() // Fetch server state to confirm
       }
     } catch {
+      setOptimisticQueueState(null)
       setError('Failed to join queue')
+    } finally {
+      setIsPending(false)
     }
-  }, [playerId, playerName, refresh])
+  }, [playerId, playerName, queueState, refresh])
 
   const leaveQueue = useCallback(async () => {
     if (!playerId) return
+
+    // Optimistic update - immediately remove player from queue
+    if (queueState) {
+      const optimistic: QueueState = {
+        ...queueState,
+        whiteQueue: queueState.whiteQueue.filter(p => p.id !== playerId),
+        blackQueue: queueState.blackQueue.filter(p => p.id !== playerId),
+        currentWhitePlayer: queueState.currentWhitePlayer?.id === playerId ? null : queueState.currentWhitePlayer,
+        currentBlackPlayer: queueState.currentBlackPlayer?.id === playerId ? null : queueState.currentBlackPlayer,
+      }
+      setOptimisticQueueState(optimistic)
+    }
+    
+    setIsPending(true)
 
     try {
       await fetch('/api/game', {
@@ -187,11 +239,14 @@ export function useGame(): UseGameReturn {
       })
       setSelectedSquare(null)
       setValidMoves([])
-      await refresh() // Immediate update after leave
+      await refresh() // Fetch server state to confirm
     } catch {
+      setOptimisticQueueState(null)
       setError('Failed to leave queue')
+    } finally {
+      setIsPending(false)
     }
-  }, [playerId, refresh])
+  }, [playerId, queueState, refresh])
 
   // Calculate valid moves client-side using chess.js - no API call needed!
   const getValidMoves = useCallback((square: Square): Move[] => {
@@ -278,6 +333,8 @@ export function useGame(): UseGameReturn {
   const confirmReady = useCallback(async () => {
     if (!playerId) return
 
+    setIsPending(true)
+
     try {
       const response = await fetch('/api/game', {
         method: 'POST',
@@ -295,6 +352,8 @@ export function useGame(): UseGameReturn {
       }
     } catch {
       setError('Failed to confirm ready')
+    } finally {
+      setIsPending(false)
     }
   }, [playerId, refresh])
 
@@ -308,7 +367,7 @@ export function useGame(): UseGameReturn {
 
   return {
     gameState,
-    queueState,
+    queueState: effectiveQueueState,
     playerId,
     playerName,
     playerColor,
@@ -323,6 +382,7 @@ export function useGame(): UseGameReturn {
     needsConfirmation,
     isConfirmed,
     timeRemaining,
+    isPending,
     setPlayerName: updatePlayerName,
     joinQueue,
     leaveQueue,

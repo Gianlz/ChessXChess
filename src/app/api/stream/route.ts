@@ -11,6 +11,8 @@ import {
   getCachedGameState,
   getCachedQueueState,
   getCachedVersion,
+  checkCrossInstanceUpdate,
+  forceHydrate,
 } from '@/lib/stateManager'
 
 export const dynamic = 'force-dynamic'
@@ -73,6 +75,9 @@ export async function GET(request: NextRequest) {
       // Register this client for broadcasts
       sseClientId = registerSSEClient(controller)
 
+      // Track the version we've sent to this client
+      let lastSentVersion = 0
+
       // Send initial state from cache (NO Redis call - uses in-memory cache)
       try {
         const [game, queue, version] = await Promise.all([
@@ -80,6 +85,7 @@ export async function GET(request: NextRequest) {
           getCachedQueueState(),
           getCachedVersion(),
         ])
+        lastSentVersion = version
         sendEvent({ game, queue: toPublicQueueState(queue), version })
         logger.debug('Stream: sent initial state from cache', { clientId: sseClientId, version })
       } catch (err) {
@@ -87,7 +93,34 @@ export async function GET(request: NextRequest) {
         sendEvent({ error: 'Failed to fetch initial state' })
       }
 
-      // Heartbeat to keep connection alive (no state fetching)
+      // Poll for cross-instance updates every 2 seconds
+      // This detects mutations from other serverless instances
+      const pollInterval = setInterval(async () => {
+        if (!isActive) {
+          clearInterval(pollInterval)
+          return
+        }
+        
+        try {
+          const newerVersion = await checkCrossInstanceUpdate(lastSentVersion)
+          if (newerVersion !== null) {
+            // Re-hydrate cache from Redis to get latest state
+            await forceHydrate()
+            lastSentVersion = newerVersion
+            
+            // Notify client of update
+            sendEvent({ type: 'update', version: newerVersion })
+            logger.debug('Stream: Detected cross-instance update', { 
+              clientId: sseClientId, 
+              version: newerVersion 
+            })
+          }
+        } catch (err) {
+          logger.error('Stream: Poll error', { error: String(err) })
+        }
+      }, 2000)
+
+      // Heartbeat to keep connection alive
       const heartbeatInterval = setInterval(() => {
         if (!isActive) {
           clearInterval(heartbeatInterval)
@@ -98,12 +131,13 @@ export async function GET(request: NextRequest) {
         } catch {
           isActive = false
         }
-      }, 30000)
+      }, 25000)
 
       // Cleanup on abort
       request.signal.addEventListener('abort', () => {
         isActive = false
         clearInterval(heartbeatInterval)
+        clearInterval(pollInterval)
         if (sseClientId) {
           unregisterSSEClient(sseClientId)
         }
@@ -113,6 +147,7 @@ export async function GET(request: NextRequest) {
       setTimeout(() => {
         isActive = false
         clearInterval(heartbeatInterval)
+        clearInterval(pollInterval)
         if (sseClientId) {
           unregisterSSEClient(sseClientId)
         }

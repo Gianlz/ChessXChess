@@ -8,6 +8,9 @@ export interface Player {
   id: string
   name: string
   joinedAt: number
+  visitorId?: string
+  fastPassTier?: 'bronze' | 'silver' | 'gold'
+  lastAutoSkipAt?: number
 }
 
 export interface TurnState {
@@ -47,6 +50,7 @@ export interface ConsolidatedState {
     fen: string
     lastMove: { from: Square; to: Square } | null
     moveHistory: string[]
+    winnerColor?: 'w' | 'b' | null
   }
   queues: {
     white: Player[]
@@ -69,6 +73,7 @@ function createDefaultState(): ConsolidatedState {
       fen: new Chess().fen(),
       lastMove: null,
       moveHistory: [],
+      winnerColor: null,
     },
     queues: {
       white: [],
@@ -84,6 +89,82 @@ function createDefaultState(): ConsolidatedState {
     },
     version: 0,
   }
+}
+
+// FastPass skip amounts per tier
+const FASTPASS_SKIP_AMOUNTS: Record<string, number> = {
+  bronze: 3,
+  silver: 5,
+  gold: 10,
+}
+
+const FASTPASS_SKIP_INTERVAL_MS = 2 * 60 * 1000 // 2 minutes
+
+// Process FastPass auto-skips for a queue
+function processFastPassSkips(queue: Player[]): boolean {
+  const now = Date.now()
+  let changed = false
+
+  // Find FastPass players who can skip
+  for (let i = 1; i < queue.length; i++) {
+    const player = queue[i]
+    if (!player.fastPassTier) continue
+
+    const lastSkip = player.lastAutoSkipAt || player.joinedAt
+    const timeSinceSkip = now - lastSkip
+
+    if (timeSinceSkip >= FASTPASS_SKIP_INTERVAL_MS) {
+      const skipAmount = FASTPASS_SKIP_AMOUNTS[player.fastPassTier] || 0
+      const targetIndex = Math.max(0, i - skipAmount)
+
+      // Can only skip ahead of non-FastPass players
+      let actualTarget = i
+      for (let j = i - 1; j >= targetIndex; j--) {
+        if (!queue[j].fastPassTier) {
+          actualTarget = j
+        } else {
+          break // Stop at another FastPass player
+        }
+      }
+
+      if (actualTarget < i) {
+        // Move player forward
+        const [movedPlayer] = queue.splice(i, 1)
+        movedPlayer.lastAutoSkipAt = now
+        queue.splice(actualTarget, 0, movedPlayer)
+        changed = true
+        // Don't break - continue checking other players
+      } else {
+        // Update skip time even if couldn't move
+        player.lastAutoSkipAt = now
+        changed = true
+      }
+    }
+  }
+
+  return changed
+}
+
+// Apply free skip for returning FastPass player
+function applyFreeSkip(queue: Player[], player: Player): number {
+  if (!player.fastPassTier) return queue.length - 1
+
+  const skipAmount = FASTPASS_SKIP_AMOUNTS[player.fastPassTier] || 0
+  const tailIndex = queue.length // Will be added at end
+  const targetIndex = Math.max(0, tailIndex - skipAmount)
+
+  // Find actual target (can't skip past other FastPass players)
+  let actualTarget = tailIndex
+  for (let j = tailIndex - 1; j >= targetIndex; j--) {
+    if (!queue[j]?.fastPassTier) {
+      actualTarget = j
+    } else {
+      break
+    }
+  }
+
+  player.lastAutoSkipAt = Date.now()
+  return actualTarget
 }
 
 function getTurnFromFen(fen: string): 'w' | 'b' {
@@ -194,11 +275,15 @@ function initializeTurnStateIfNeeded(state: ConsolidatedState): void {
 }
 
 // Check and expire turns - called lazily on state access
-// Also initializes turn state for waiting players
+// Also initializes turn state for waiting players and processes FastPass skips
 function checkAndExpireTurnsInline(state: ConsolidatedState): boolean {
   const now = Date.now()
   const turn = getTurnFromFen(state.game.fen)
   let changed = false
+
+  // Process FastPass auto-skips for both queues
+  if (processFastPassSkips(state.queues.white)) changed = true
+  if (processFastPassSkips(state.queues.black)) changed = true
 
   // Only check the current turn's player
   if (turn === 'w' && state.current.white) {
@@ -368,9 +453,19 @@ class InMemoryStore {
         state.game.lastMove = { from, to }
         state.game.moveHistory = chess.history()
 
-        // Return player to queue
+        // Check for checkmate and set winner
+        if (chess.isCheckmate()) {
+          state.game.winnerColor = currentTurn // The player who just moved wins
+        }
+
+        // Return player to queue with potential free skip for FastPass
         const queue = currentTurn === 'w' ? state.queues.white : state.queues.black
-        queue.push(currentPlayer)
+        if (currentPlayer.fastPassTier) {
+          const insertIndex = applyFreeSkip(queue, currentPlayer)
+          queue.splice(insertIndex, 0, currentPlayer)
+        } else {
+          queue.push(currentPlayer)
+        }
 
         // Clear current and assign next for the color that just moved
         if (currentTurn === 'w') {
@@ -401,6 +496,7 @@ class InMemoryStore {
       fen: new Chess().fen(),
       lastMove: null,
       moveHistory: [],
+      winnerColor: null,
     }
     state.version++
     return { success: true, state }
@@ -658,9 +754,19 @@ class RedisStore {
         state.game.lastMove = { from, to }
         state.game.moveHistory = chess.history()
 
-        // Return player to queue
+        // Check for checkmate and set winner
+        if (chess.isCheckmate()) {
+          state.game.winnerColor = currentTurn // The player who just moved wins
+        }
+
+        // Return player to queue with potential free skip for FastPass
         const queue = currentTurn === 'w' ? state.queues.white : state.queues.black
-        queue.push(currentPlayer)
+        if (currentPlayer.fastPassTier) {
+          const insertIndex = applyFreeSkip(queue, currentPlayer)
+          queue.splice(insertIndex, 0, currentPlayer)
+        } else {
+          queue.push(currentPlayer)
+        }
 
         // Clear current and assign next for the color that just moved
         if (currentTurn === 'w') {
@@ -691,6 +797,7 @@ class RedisStore {
         fen: new Chess().fen(),
         lastMove: null,
         moveHistory: [],
+        winnerColor: null,
       }
       return { success: true }
     })

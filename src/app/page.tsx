@@ -10,8 +10,11 @@ import PromotionModal from '@/components/PromotionModal'
 import MusicPlayer from '@/components/MusicPlayer'
 import ShaderBackground from '@/components/ShaderBackground'
 import { useGame } from '@/hooks/useGame'
+import { useFastPass } from '@/hooks/useFastPass'
 import ConnectionStatus from '@/components/ConnectionStatus'
 import TurnNotification from '@/components/TurnNotification'
+import FastPassModal from '@/components/FastPassModal'
+import Leaderboard from '@/components/Leaderboard'
 
 export default function Home() {
   const {
@@ -29,6 +32,7 @@ export default function Home() {
     needsConfirmation,
     isConfirmed,
     timeRemaining,
+    isPending,
     setPlayerName,
     joinQueue,
     leaveQueue,
@@ -39,7 +43,19 @@ export default function Home() {
     confirmReady,
   } = useGame()
 
+  const {
+    status: fastPassStatus,
+    error: fastPassError,
+    visitorId,
+    showModal: showFastPassModal,
+    isPurchasing,
+    openModal: openFastPassModal,
+    closeModal: closeFastPassModal,
+    purchaseFastPass,
+  } = useFastPass()
+
   const [nameInput, setNameInput] = useState('')
+  const [leaderboardRefresh, setLeaderboardRefresh] = useState(0)
   const [pendingPromotion, setPendingPromotion] = useState<{ from: Square; to: Square } | null>(null)
 
   const handleNameSubmit = (e: React.FormEvent) => {
@@ -171,11 +187,19 @@ export default function Home() {
       </div>
 
       {/* Error toast */}
-      {error && (
+      {(error || fastPassError) && (
         <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 glass rounded-full px-6 py-3 text-red-400">
-          {error}
+          {error || fastPassError}
         </div>
       )}
+
+      {/* FastPass Modal */}
+      <FastPassModal
+        isOpen={showFastPassModal}
+        onClose={closeFastPassModal}
+        onPurchase={purchaseFastPass}
+        isLoading={isPurchasing}
+      />
 
       {/* Turn notification */}
       <TurnNotification
@@ -234,7 +258,15 @@ export default function Home() {
             onLeaveQueue={leaveQueue}
             isInQueue={isInQueue}
             playerColor={playerColor}
+            isPending={isPending}
+            fastPassStatus={fastPassStatus}
+            onOpenFastPass={openFastPassModal}
           />
+          
+          {/* Leaderboard */}
+          <div className="mt-4">
+            <Leaderboard visitorId={visitorId} refreshTrigger={leaderboardRefresh} />
+          </div>
         </div>
 
         {/* Center - Chess board */}
